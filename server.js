@@ -19,10 +19,6 @@ const express = require("express");
 const compression = require("compression");
 
 const ROOT = __dirname; // the VDO.Ninja files live at the repo root
-// Default port 8366 spells "VDON" (VDO.Ninja) on a phone keypad. A hosting
-// platform's PORT env var always overrides this in production.
-const PORT = process.env.PORT || 8366;
-const HOST = process.env.HOST || "0.0.0.0";
 
 const app = express();
 
@@ -49,9 +45,35 @@ app.disable("x-powered-by");
 // -- that could leave the server trusting the wrong hops -- it fails fast at
 // boot with an error that names TRUST_PROXY and the value it rejected.
 const rawTrustProxy = (process.env.TRUST_PROXY ?? "").trim();
-const trustProxy = rawTrustProxy === "" ? "loopback" : rawTrustProxy.toLowerCase() === "false" ? false : /^\d+$/.test(rawTrustProxy) ? Number(rawTrustProxy) : rawTrustProxy;
+
+// ---------------------------------------------------------------------------
+// Centralized, validated server configuration (F7). Every environment-driven
+// knob is read from process.env exactly once, here -- add new settings to
+// this object instead of reading process.env inline elsewhere in the file.
+// `theme` and `logRequests` aren't consumed by anything yet; they're the
+// intentional single-surface seam reserved for later work (F16 theme
+// injection, F11 request logging) to extend instead of adding another ad hoc
+// env read.
+// ---------------------------------------------------------------------------
+const config = {
+	// Default port 8366 spells "VDON" (VDO.Ninja) on a phone keypad. A hosting
+	// platform's PORT env var always overrides this in production.
+	// Number.parseInt("", 10) and any non-numeric value both yield NaN, so
+	// `|| 8366` catches those the same as unset -- instead of a bad string
+	// silently reaching net.Server#listen() and failing deep inside Node with
+	// an obscure error.
+	port: Number.parseInt(process.env.PORT, 10) || 8366,
+	host: process.env.HOST || "0.0.0.0",
+	trustProxy: rawTrustProxy === "" ? "loopback" : rawTrustProxy.toLowerCase() === "false" ? false : /^\d+$/.test(rawTrustProxy) ? Number(rawTrustProxy) : rawTrustProxy,
+	turnServer: process.env.TURN_SERVER || null,
+	signalingHost: process.env.SIGNALING_HOST || null,
+	brandName: process.env.BRAND_NAME || "VDO.Ninja",
+	theme: process.env.THEME || null,
+	logRequests: process.env.LOG_REQUESTS === "true"
+};
+
 try {
-	app.set("trust proxy", trustProxy);
+	app.set("trust proxy", config.trustProxy);
 } catch (err) {
 	console.error(`Invalid TRUST_PROXY value ${JSON.stringify(rawTrustProxy)}: ${err.message}. Accepted: an integer hop count, "false" (any case), a preset (loopback/linklocal/uniquelocal), an IP, a CIDR, or a comma-list of those.`);
 	process.exit(1);
@@ -111,10 +133,10 @@ app.get("/healthz", (req, res) => {
 // Handy for injecting your own TURN server, signaling host, or branding without
 // editing the (frequently-updated) VDO.Ninja source files.
 app.get("/config.js", (req, res) => {
-	const config = {
-		turnServer: process.env.TURN_SERVER || null,
-		signalingHost: process.env.SIGNALING_HOST || null,
-		brandName: process.env.BRAND_NAME || "VDO.Ninja"
+	const clientConfig = {
+		turnServer: config.turnServer,
+		signalingHost: config.signalingHost,
+		brandName: config.brandName
 	};
 	res.type("application/javascript");
 	// This is regenerated from the environment on every request, so a deploy-time
@@ -123,7 +145,7 @@ app.get("/config.js", (req, res) => {
 	// still lets res.send()'s auto-generated ETag do its job: unchanged config
 	// comes back as a cheap 304 with no body instead of a full re-send every time.
 	res.setHeader("Cache-Control", "no-cache");
-	res.send(`window.CUSTOM_CONFIG = ${JSON.stringify(config)};`);
+	res.send(`window.CUSTOM_CONFIG = ${JSON.stringify(clientConfig)};`);
 });
 
 // ---------------------------------------------------------------------------
@@ -395,6 +417,6 @@ app.use((err, req, res, next) => {
 	sendError(req, res, 500, "Server error", "Something went wrong — please try again.");
 });
 
-app.listen(PORT, HOST, () => {
-	console.log(`VDO.Ninja client serving on http://${HOST === "0.0.0.0" ? "localhost" : HOST}:${PORT}`);
+app.listen(config.port, config.host, () => {
+	console.log(`VDO.Ninja client serving on http://${config.host === "0.0.0.0" ? "localhost" : config.host}:${config.port}`);
 });
