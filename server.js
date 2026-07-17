@@ -42,8 +42,11 @@ app.use((req, res, next) => {
 // CUSTOM ROUTES — add your customizations here (they take priority over files)
 // ---------------------------------------------------------------------------
 
-// Health check for the hosting platform's uptime probes.
+// Health check for the hosting platform's uptime probes. The body changes
+// every call (uptime) and monitoring systems must always see the live
+// status, so tell every cache (browser, proxy, CDN) not to store this at all.
 app.get("/healthz", (req, res) => {
+	res.setHeader("Cache-Control", "no-store");
 	res.json({ ok: true, uptime: process.uptime() });
 });
 
@@ -58,6 +61,12 @@ app.get("/config.js", (req, res) => {
 		brandName: process.env.BRAND_NAME || "VDO.Ninja"
 	};
 	res.type("application/javascript");
+	// This is regenerated from the environment on every request, so a deploy-time
+	// config change (new TURN server, new signaling host, rebranding) must reach
+	// browsers immediately, not after a cache expires. "no-cache" (not "no-store")
+	// still lets res.send()'s auto-generated ETag do its job: unchanged config
+	// comes back as a cheap 304 with no body instead of a full re-send every time.
+	res.setHeader("Cache-Control", "no-cache");
 	res.send(`window.CUSTOM_CONFIG = ${JSON.stringify(config)};`);
 });
 
@@ -186,13 +195,104 @@ app.use((req, res, next) => {
 	next();
 });
 
+// ---------------------------------------------------------------------------
+// Cache-Control policy (F3)
+// ---------------------------------------------------------------------------
+// The client cache-busts by putting a version marker in the query string of
+// the <script>/<link> tag that loads it -- "?ver=NNN" on most files, but
+// "?v=7" on auth-client.js (see CLAUDE.md's "Cache-busting version numbers";
+// both spellings are genuinely in use, check both). Only a request that
+// actually carries one of those params is eligible for the long-cache
+// branch below -- an unversioned request is always "no-cache" instead.
+//
+// That gate is necessary but NOT sufficient to hard-cache for a full year:
+// it assumes the URL changes the moment the file's content does, which
+// depends on a human remembering to bump "?ver=" on every HTML page that
+// references the file. That discipline is real but demonstrably imperfect
+// -- e.g. room.html's lib.js?ver= has been bumped in only 3 of the last 30
+// commits that changed lib.js's content, and is currently stale against 7
+// of them, pinning an older version of the file than index.html requests.
+// Since room.html itself is always "no-cache" (below), a missed bump means
+// a returning visitor gets fresh HTML that still points at a stale script
+// URL -- an inconsistent HTML/script mix, not just an old snapshot. Pairing
+// that with "immutable" and a one-year max-age would suppress revalidation
+// even on a manual reload, so the visitor has no way to self-rescue short
+// of clearing site data. So this deliberately bounds the long-cache window
+// instead: VERSIONED_ASSET_MAX_AGE_SECONDS (1 hour) still removes the
+// revalidation round trip for repeat loads within that window -- the RTT
+// savings F3 actually asked for, and the dominant case for a returning
+// visitor's session -- while letting a missed bump self-heal within an
+// hour instead of wedging a visitor for a year. Raise this only once the
+// "?ver=" bump discipline is enforced somehow (e.g. CI failing a PR that
+// changes lib.js/main.js/main.css/webrtc.js without bumping every
+// referencing page) -- that is a client/CI change, out of scope here.
+const VERSIONED_ASSET_MAX_AGE_SECONDS = 3600;
+//
+// Most files in this repo carry NO version param anywhere they're
+// referenced: most of the ES-module graph under core/ and podcast/
+// (bootstrap.js itself is loaded via <script type="module"
+// src="./podcast/bootstrap.js"> with no param, and everything under core/
+// is imported unversioned) -- though module specifiers CAN carry a query
+// param, and two here do: podcast/bootstrap.js imports "./studio.js?v=16"
+// and podcast/studio.js imports "./icecast-publisher.js?v=2". A third file,
+// podcast/studio.css?v=15, is versioned too, but as a <link> href built at
+// runtime by podcast/studio.js rather than a module specifier. All three DO
+// get the long-cache treatment above and their "?v=" must be bumped when
+// their contents change. Also unversioned: thirdparty/adapter.js,
+// thirdparty/aes.js, auth-styles.css, manifest.json, translations/*.json
+// (fetched at runtime by lib.js), presets.json (fetched by lib.js), and
+// everything under media/. An unversioned request gets "no-cache": the
+// browser still keeps the bytes, but must send a conditional GET
+// (If-None-Match/If-Modified-Since) before reusing them. express.static
+// already emits ETag + Last-Modified for every file, so that conditional
+// request is a cheap 304-with-empty-body, not a re-download -- correctness
+// (a fix actually reaching users) is worth far more here than shaving the
+// one round trip off files that mostly aren't the multi-megabyte ones.
+//
+// Forker note: if you add a reference to a new asset that changes over
+// time, give the URL a "?ver=" or "?v=" query param (and bump it whenever
+// the file's contents change) the same way the existing assets do.
+// Otherwise it will only ever be revalidated, never long-cached. Module
+// specifiers (bare imports and dynamic import()) can carry the param too,
+// not just <script src>/<link href> -- see podcast/studio.js above for a
+// live example.
+
+// True if this request's query string carries a cache-busting version
+// marker in either spelling used across the repo ("?ver=" or "?v=").
+// express's built-in query-parser middleware (installed by app.use/app.get
+// the first time either is called, see lazyrouter() in express's
+// application.js) always runs before any route/middleware registered here,
+// so `req.query` is already populated by the time this fires -- verified
+// live below.
+function hasVersionParam(req) {
+	return req.query != null && (req.query.ver !== undefined || req.query.v !== undefined);
+}
+
 // Serve real files. `extensions: ["html"]` makes /mixer resolve to mixer.html;
 // `index` serves index.html for directory roots.
 app.use(
 	express.static(ROOT, {
 		extensions: ["html"],
 		index: "index.html",
-		dotfiles: "ignore"
+		dotfiles: "ignore",
+		setHeaders(res, filePath) {
+			if (filePath.endsWith(".html")) {
+				// HTML carries the ?ver=/?v= pointers into the assets above it, so
+				// caching HTML would pin visitors to old asset versions and quietly
+				// defeat the whole cache-busting scheme -- always revalidate it.
+				res.setHeader("Cache-Control", "no-cache");
+			} else if (hasVersionParam(res.req)) {
+				// send/serve-static invoke setHeaders with the real http.ServerResponse,
+				// which Node populates with a `.req` back-reference to the original
+				// request (see the Node docs for response.req) -- and because Express
+				// mutates that same request object's prototype/properties in place
+				// rather than copying it, res.req here is the fully-Express-augmented
+				// request, `.query` included.
+				res.setHeader("Cache-Control", `public, max-age=${VERSIONED_ASSET_MAX_AGE_SECONDS}`);
+			} else {
+				res.setHeader("Cache-Control", "no-cache");
+			}
+		}
 	})
 );
 
@@ -203,6 +303,10 @@ app.use(
 app.use((req, res) => {
 	const hasFileExtension = path.extname(req.path) !== "";
 	if (req.method === "GET" && !hasFileExtension && req.accepts("html")) {
+		// res.sendFile() does NOT go through express.static's setHeaders above,
+		// so it needs the same "HTML holds the ?ver= pointers" no-cache policy
+		// set explicitly here or this fallback would silently miss it.
+		res.setHeader("Cache-Control", "no-cache");
 		res.sendFile(path.join(ROOT, "index.html"));
 	} else {
 		res.status(404).end();
