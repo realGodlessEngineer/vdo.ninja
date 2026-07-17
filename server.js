@@ -26,8 +26,32 @@ const HOST = process.env.HOST || "0.0.0.0";
 
 const app = express();
 
-// Hosting platforms terminate TLS at a proxy and forward via X-Forwarded-* headers.
-app.set("trust proxy", true);
+// TRUST_PROXY controls how Express derives req.ip / req.protocol from the
+// client-spoofable X-Forwarded-* headers. There's no IP-based logic in this
+// app today, but any future rate limiter, IP allowlist, or access log would
+// inherit whatever this is set to, so it defaults to "loopback": trust only
+// 127.0.0.1/::1. That's safe with no proxy in front (no untrusted hop can
+// inject those headers) and also correct for a same-host reverse proxy. A
+// platform that puts exactly one proxy in front of this server (Railway,
+// Fly, Heroku, a remote Nginx/Caddy box, etc.) should set TRUST_PROXY=1 to
+// trust just that one hop. Accepted values: an integer hop count ("1", "2",
+// ...), "false" (matched case-insensitively, e.g. "FALSE"/"False" also work)
+// to disable trust entirely, or anything else passed through verbatim to
+// Express, which understands preset names ("loopback", "linklocal",
+// "uniquelocal"), single IPs, CIDR subnets ("10.0.0.0/8"), and
+// comma-separated lists of those. Unset, empty, or whitespace-only falls
+// back to the "loopback" default rather than being passed through. An
+// unrecognized/invalid value (e.g. "-1", "off") is never silently defaulted
+// -- that could leave the server trusting the wrong hops -- it fails fast at
+// boot with an error that names TRUST_PROXY and the value it rejected.
+const rawTrustProxy = (process.env.TRUST_PROXY ?? "").trim();
+const trustProxy = rawTrustProxy === "" ? "loopback" : rawTrustProxy.toLowerCase() === "false" ? false : /^\d+$/.test(rawTrustProxy) ? Number(rawTrustProxy) : rawTrustProxy;
+try {
+	app.set("trust proxy", trustProxy);
+} catch (err) {
+	console.error(`Invalid TRUST_PROXY value ${JSON.stringify(rawTrustProxy)}: ${err.message}. Accepted: an integer hop count, "false" (any case), a preset (loopback/linklocal/uniquelocal), an IP, a CIDR, or a comma-list of those.`);
+	process.exit(1);
+}
 
 // gzip responses. lib.js (~2MB) and webrtc.js (~700KB) compress dramatically.
 app.use(compression());
