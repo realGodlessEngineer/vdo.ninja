@@ -26,6 +26,10 @@ const HOST = process.env.HOST || "0.0.0.0";
 
 const app = express();
 
+// Don't advertise the framework in responses -- trivial info leak that helps
+// an attacker fingerprint the stack for known Express CVEs.
+app.disable("x-powered-by");
+
 // TRUST_PROXY controls how Express derives req.ip / req.protocol from the
 // client-spoofable X-Forwarded-* headers. There's no IP-based logic in this
 // app today, but any future rate limiter, IP allowlist, or access log would
@@ -57,8 +61,16 @@ try {
 app.use(compression());
 
 // Match production: allow the client and its assets to be embedded / fetched cross-origin.
+// Also set a small set of safe, non-breaking security headers on every response here.
+// Deliberately NOT set: X-Frame-Options or a CSP frame-ancestors directive. Embedding
+// VDO.Ninja via <iframe> is a first-class, documented feature (see CLAUDE.md's "IFRAME
+// API" section) and OBS Browser Sources rely on it -- either header would break embedding.
+// Do not "helpfully" add one; that's the whole reason this comment exists.
 app.use((req, res, next) => {
 	res.setHeader("Access-Control-Allow-Origin", "*");
+	res.setHeader("X-Content-Type-Options", "nosniff");
+	res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+	res.setHeader("Strict-Transport-Security", "max-age=15552000; includeSubDomains");
 	next();
 });
 
