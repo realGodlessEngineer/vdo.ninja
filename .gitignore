@@ -1,5 +1,5 @@
 node_modules/
-package-lock.json
+docs/
 turn-credentials.php
 .vscode/
 .claude
@@ -8,5 +8,4 @@ AGENTS.md
 CLAUDE.md
 cf/
 wrangler.toml
-package.json
 docs.md
