@@ -75,6 +75,26 @@ app.use((req, res, next) => {
 });
 
 // ---------------------------------------------------------------------------
+// Error responses (F6): one content-negotiated helper reused by both 404
+// sites below and the final error handler at the bottom of the file. An HTML
+// client (req.accepts("html")) gets a minimal, accessible, self-contained
+// document -- lang, viewport, a heading, a short message, and a link home --
+// instead of an empty white page; anything else (fetch/XHR/curl/an API
+// consumer) gets a small JSON body instead. `heading` and `body` are always
+// hardcoded string literals passed by the call sites in this file, never
+// request data (URL, headers, params, query) -- keep it that way, or this
+// becomes a reflected-XSS sink.
+// ---------------------------------------------------------------------------
+function sendError(req, res, status, heading, body) {
+	res.status(status);
+	if (req.accepts("html")) {
+		res.type("html").send(`<!doctype html><html lang="en"><head><meta charset="utf-8">` + `<meta name="viewport" content="width=device-width,initial-scale=1">` + `<title>${status} — ${heading}</title></head>` + `<body style="font-family:system-ui;max-width:40rem;margin:4rem auto;padding:0 1rem">` + `<h1>${status} — ${heading}</h1><p>${body} <a href="/">Return home</a>.</p></body></html>`);
+	} else {
+		res.json({ error: status === 404 ? "not_found" : "internal_error" });
+	}
+}
+
+// ---------------------------------------------------------------------------
 // CUSTOM ROUTES — add your customizations here (they take priority over files)
 // ---------------------------------------------------------------------------
 
@@ -226,7 +246,10 @@ app.use((req, res, next) => {
 	// caught by send's traversal guard either.
 	const isChildOfBlockedFile = BLOCKED_EXACT_LIST.some(name => normalized.startsWith(name + "/"));
 	if (isBlockedName || isChildOfBlockedFile) {
-		return res.status(404).end(); // 404, not 403 — don't confirm the file exists
+		// 404, not 403 — don't confirm the file exists. Same generic sendError()
+		// every other missing path gets below, so the response body/status gives
+		// no signal that this particular path hit the deny-list.
+		return sendError(req, res, 404, "Not found", "That page or asset doesn’t exist.");
 	}
 	next();
 });
@@ -345,8 +368,31 @@ app.use((req, res) => {
 		res.setHeader("Cache-Control", "no-cache");
 		res.sendFile(path.join(ROOT, "index.html"));
 	} else {
-		res.status(404).end();
+		sendError(req, res, 404, "Not found", "That page or asset doesn’t exist.");
 	}
+});
+
+// ---------------------------------------------------------------------------
+// Final error handler (F6) — must be the LAST app.use(), after every route
+// and the SPA fallback above, so Express routes any thrown error or
+// next(err) call here instead of its own default handler, which (with
+// NODE_ENV !== "production") renders an HTML page containing a stack trace —
+// leaking internal file paths and versions on top of the F5 fingerprint leak
+// this file already closes elsewhere.
+// ---------------------------------------------------------------------------
+app.use((err, req, res, next) => {
+	// Per the Express docs: once headers are sent, a custom error handler must
+	// NOT attempt to send another response -- delegate to Express's built-in
+	// handler, which knows how to finish/abort the in-flight response without
+	// corrupting it. Only render the friendly 500 below when nothing has gone
+	// out yet.
+	if (res.headersSent) {
+		return next(err);
+	}
+	// The real error (message, stack, internal paths) is logged server-side
+	// only -- the client only ever sees the generic, hardcoded 500 page/JSON.
+	console.error("Unhandled error:", err);
+	sendError(req, res, 500, "Server error", "Something went wrong — please try again.");
 });
 
 app.listen(PORT, HOST, () => {
