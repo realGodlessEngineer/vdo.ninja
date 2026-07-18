@@ -32,13 +32,17 @@ const zlib = require("zlib");
 const ROOT = path.join(__dirname, "..");
 
 // Directories never worth walking: the dependency tree, gitignored internal
-// audit docs, VCS internals, and this script's own directory. Matched by
-// exact directory name so it applies at any depth, even though today each of
-// these only exists once, directly under ROOT. "scripts" must stay in sync
-// with server.js's BLOCKED_PREFIXES (which blocks "/scripts/" for the same
+// audit docs, VCS internals, this script's own directory, and the gated
+// server-side theme sheets. Matched by exact directory name so it applies at
+// any depth, even though today each of these only exists once, directly under
+// ROOT. "scripts" and "themes" must stay in sync with server.js's
+// BLOCKED_PREFIXES (which blocks "/scripts/" and "/themes/" for the same
 // reason it blocks "/node_modules/" and "/docs/") -- there's no point
-// generating a .br/.gz sibling for a file the server will never serve.
-const EXCLUDED_DIR_NAMES = new Set(["node_modules", "docs", ".git", "scripts"]);
+// generating a .br/.gz sibling for a file the server will never serve. (For
+// "themes" specifically: the gated "/theme.css" route res.sendFile()s the
+// exact .css absolute path, never a .br/.gz variant, and "/themes/" is
+// deny-listed for direct static access -- so any sibling would be dead.)
+const EXCLUDED_DIR_NAMES = new Set(["node_modules", "docs", ".git", "scripts", "themes"]);
 
 // Extensions worth precompressing: the client's own text assets. This is an
 // ALLOWLIST, not a "skip known-binary extensions" denylist -- deliberately,

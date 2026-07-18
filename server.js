@@ -15,6 +15,7 @@
  */
 
 const path = require("path");
+const fs = require("fs");
 const express = require("express");
 const compression = require("compression");
 
@@ -78,6 +79,20 @@ try {
 } catch (err) {
 	console.error(`Invalid TRUST_PROXY value ${JSON.stringify(rawTrustProxy)}: ${err.message}. Accepted: an integer hop count, "false" (any case), a preset (loopback/linklocal/uniquelocal), an IP, a CIDR, or a comma-list of those.`);
 	process.exit(1);
+}
+
+// F16: the operator-supplied THEME name is only honored if it's a simple slug
+// -- letters, digits, "-" and "_" only. That guarantee is what lets it be
+// composed into a filesystem path below (themes/<name>.css) without risk: no
+// path separator, no "..", nothing that could traverse out of themes/. A
+// set-but-invalid value disables theming rather than crashing this purely
+// cosmetic feature at boot, and is announced once so an operator who typo'd
+// knows why their theme didn't load. Both F16 surfaces (the /theme.css route
+// and the HTML-injection middleware) gate on THEME_NAME, not config.theme, so
+// an unsafe value is inert everywhere.
+const THEME_NAME = config.theme && /^[a-zA-Z0-9_-]+$/.test(config.theme) ? config.theme : null;
+if (config.theme && !THEME_NAME) {
+	console.warn(`Ignoring THEME=${JSON.stringify(config.theme)}: theme names may contain only letters, digits, "-" and "_".`);
 }
 
 // gzip responses. lib.js (~2MB) and webrtc.js (~700KB) compress dramatically.
@@ -173,6 +188,39 @@ app.get("/config.js", (req, res) => {
 	res.send(`window.CUSTOM_CONFIG = ${json};`);
 });
 
+// F16: serve the active theme's override sheet from themes/ (a folder next to
+// server.js that is deliberately kept off the normal static path -- see the
+// "/themes/" deny-list prefix below -- so this gated route is the ONLY way to
+// reach a theme file). Gated on THEME_NAME: when no valid theme is active this
+// route steps aside via next() and the request 404s like any other unknown
+// path, so the feature is genuinely absent when off. "no-cache" (not a long
+// max-age) keeps the small sheet fresh so an operator iterating on a theme
+// sees edits on reload; there's no meaningful caching win to give up on a tiny
+// file. Content-Type/Cache-Control are threaded through res.sendFile's
+// `headers` option (mirroring the precompressed middleware below) so they're
+// only applied once `send` has confirmed the file exists -- a missing or
+// mistyped theme file then falls cleanly through to a 404 instead of emitting
+// a half-set text/css response.
+app.get("/theme.css", (req, res, next) => {
+	if (!THEME_NAME) return next();
+	res.sendFile(
+		path.join(ROOT, "themes", `${THEME_NAME}.css`),
+		{
+			headers: {
+				"Content-Type": "text/css; charset=UTF-8",
+				"Cache-Control": "no-cache"
+			}
+		},
+		err => {
+			if (!err) return; // response already sent
+			// ENOENT / 404-shaped: no such theme file on disk -- fall through to
+			// the normal 404. Anything else (permissions, I/O) is a real error.
+			if (err.code === "ENOENT" || err.status === 404 || err.statusCode === 404) return next();
+			next(err);
+		}
+	);
+});
+
 // ---------------------------------------------------------------------------
 // STATIC FILE SERVING (production-like URL behavior)
 // ---------------------------------------------------------------------------
@@ -238,7 +286,16 @@ const BLOCKED_EXACT_LIST = [...BLOCKED_EXACT];
 // exists at the repo root, so unlike "/docs" there's no clean-URL page this
 // would shadow -- bare "/scripts" is deliberately left unblocked/unlisted
 // for the same reason "/docs" is.
-const BLOCKED_PREFIXES = ["/node_modules/", "/docs/", "/scripts/"]; // this dir and everything under it
+//
+// "/themes/" (F16) holds the server-side theme override sheets. They are meant
+// to be reachable ONLY through the gated "/theme.css" route (which reads the
+// active theme by an absolute path via res.sendFile, so it is unaffected by
+// this deny-list) -- never as directly-addressable static files. Blocking the
+// prefix here means an ungated "/themes/red-black.css" is never served
+// alongside the gated route, and unsetting THEME leaves nothing under here
+// reachable at all. Like "/scripts", no "themes.html" page exists to shadow,
+// so bare "/themes" is deliberately left unlisted.
+const BLOCKED_PREFIXES = ["/node_modules/", "/docs/", "/scripts/", "/themes/"]; // this dir and everything under it
 
 // Reduces a raw request path to a canonical form for comparison against the
 // deny-list above, closing the path-normalization tricks that would otherwise
@@ -312,6 +369,128 @@ app.use((req, res, next) => {
 	}
 	next();
 });
+
+// ---------------------------------------------------------------------------
+// Theme injection (F16, Option A: server-side HTML injection, zero client edits)
+// ---------------------------------------------------------------------------
+// When a valid THEME is active, inject exactly one
+// <link rel="stylesheet" href="/theme.css?ver=1"> immediately before the FIRST
+// </head> of every HTML page the server would otherwise serve: index.html,
+// room.html, the standalone tool pages (/mixer, /whiteboard, ...), directory
+// index pages, and -- the headline case -- the SPA-fallback index.html served
+// for clean/room URLs like /someRoom. Because it edits NO client file, a
+// forker's `git pull` never conflicts with the theme, and unsetting THEME
+// removes it entirely.
+//
+// The whole block is registered ONLY when a theme is active. For the many
+// self-hosters who never set THEME it isn't even in the middleware chain --
+// literally zero added work on any request, HTML or asset.
+//
+// Placement is load-bearing (this sits after the deny-list above and before
+// the precompressed-asset middleware / express.static / SPA fallback below):
+//   * AFTER the /foo.html -> /foo redirect, so a *.html request still 302s to
+//     its clean URL first -- the clean-URL redirect (and its test) is
+//     untouched. This middleware only themes the extensionless clean/room URLs
+//     that redirect produces; it never serves a *.html path itself.
+//   * AFTER the deny-list, so a blocked internal (server.js, node_modules/,
+//     docs/, scripts/, themes/) is 404'd before this can read it -- the theme
+//     can never resurrect a blocked path.
+//   * BEFORE express.static + the SPA fallback, so it intercepts and themes the
+//     extensionless navigations they would otherwise serve un-themed. It
+//     mirrors the SPA fallback's own guards (GET, extensionless, not a
+//     dot-path, req.accepts("html")) and resolves to the very file
+//     express.static / the fallback would serve, so a themed response is only
+//     ever that exact page plus one <link> -- never injected into a 404, an
+//     asset, or the wrong page.
+if (THEME_NAME) {
+	const THEME_LINK = `<link rel="stylesheet" href="/theme.css?ver=1">`;
+
+	// Inject the <link> before the first </head> and send it no-cache (F3's
+	// HTML policy -- res.send bypasses express.static's setHeaders, so it's set
+	// here explicitly). String#replace with a string needle replaces ONLY the
+	// first match and is case-sensitive; every shipped page has a single
+	// lowercase </head> (verified). A page with no </head> is sent unchanged
+	// (replace is then a no-op) rather than corrupted.
+	const injectAndSend = (res, html) => {
+		res.type("html");
+		res.setHeader("Cache-Control", "no-cache");
+		res.send(html.replace("</head>", THEME_LINK + "</head>"));
+	};
+
+	app.use((req, res, next) => {
+		// Assets (anything with a file extension) and non-GET requests fall
+		// straight through untouched -- only extensionless navigations are
+		// themed, so the big cacheable JS/CSS/image path pays nothing here
+		// beyond this one extname check.
+		//
+		// GET-only is deliberate (V002). A HEAD for an HTML page falls
+		// through to express.static, which answers from the file's stat and
+		// reports its UN-injected Content-Length -- short of the themed GET
+		// body by exactly one <link> (~47 bytes). RFC 9110 §9.3.2 says a HEAD
+		// response's headers SHOULD match the equivalent GET, so this is a
+		// genuine (if inert) divergence, left as-is on purpose rather than
+		// synthesizing an injected body just to advertise its length with no
+		// payload: themed HTML is served no-cache, the themed GET itself goes
+		// out chunked/compressed with NO Content-Length at all (so in practice
+		// there's nothing for a client to compare against), and HEAD-probing an
+		// HTML page before navigating isn't a real access pattern for this app.
+		// F14's precompressed-asset middleware does handle both GET and HEAD,
+		// but there the served bytes are a fixed on-disk file with a real
+		// Content-Length worth advertising; here the body is synthesized per
+		// request, so HEAD is intentionally left to express.static.
+		if (req.method !== "GET") return next();
+		if (path.extname(req.path) !== "") return next();
+
+		// Decode and mirror the SPA fallback's dot-path + content-negotiation
+		// guards, so we never inject into a path it would 404 (a dotfile scan)
+		// or hand an HTML document to a non-HTML client.
+		let decodedPath;
+		try {
+			decodedPath = decodeURIComponent(req.path);
+		} catch {
+			decodedPath = req.path; // malformed % escape; compare the raw path
+		}
+		const isDotPath = decodedPath.split("/").some(segment => segment.startsWith("."));
+		if (isDotPath || !req.accepts("html")) return next();
+
+		// Re-derive the target file from the decoded path and containment-check
+		// it against ROOT (never trust req.path raw), exactly like the
+		// precompressed-asset middleware does, so a crafted path can't read
+		// outside ROOT.
+		const candidate = path.normalize(path.join(ROOT, decodedPath));
+		if (candidate !== ROOT && !candidate.startsWith(ROOT + path.sep)) return next();
+
+		// Resolve to the same file express.static + the SPA fallback would serve,
+		// so the themed body is byte-for-byte that page plus one <link>:
+		fs.stat(candidate, (statErr, stats) => {
+			if (!statErr) {
+				if (stats.isDirectory()) {
+					// A directory URL. Without a trailing slash, express.static
+					// 301s to add one (so the page's relative URLs resolve against
+					// the right base) -- don't pre-empt that redirect; let it
+					// through un-themed. With a trailing slash (including "/"
+					// itself) the served page is <dir>/index.html; theme it, or
+					// fall through if the directory has no index.html so
+					// express.static gives its usual response.
+					if (!decodedPath.endsWith("/")) return next();
+					return fs.readFile(path.join(candidate, "index.html"), "utf8", (err, html) => (err ? next() : injectAndSend(res, html)));
+				}
+				// An existing extensionless real file (a LICENSE, etc.):
+				// express.static serves it as-is -- it isn't an HTML page to
+				// theme -- so fall through untouched.
+				return next();
+			}
+			// candidate doesn't exist as-is: a clean tool URL (/mixer ->
+			// mixer.html, /room -> room.html) when <name>.html exists, else the
+			// SPA fallback's index.html for a room-style URL (/someRoom). The
+			// first readFile's ENOENT is what drives that fallback.
+			fs.readFile(candidate + ".html", "utf8", (err, html) => {
+				if (!err) return injectAndSend(res, html);
+				fs.readFile(path.join(ROOT, "index.html"), "utf8", (spaErr, spaHtml) => (spaErr ? next() : injectAndSend(res, spaHtml)));
+			});
+		});
+	});
+}
 
 // ---------------------------------------------------------------------------
 // Cache-Control policy (F3)

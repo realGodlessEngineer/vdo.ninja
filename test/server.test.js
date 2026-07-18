@@ -173,3 +173,103 @@ test("F14: a versioned asset with a precompressed sibling is served brotli-encod
 		}
 	}
 });
+
+// ---------------------------------------------------------------------------
+// F16 — /theme.css route + server-side theme <link> injection.
+// ---------------------------------------------------------------------------
+// server.js reads the THEME env var exactly once, at require time, into its
+// frozen `config` (and derived `THEME_NAME`). The suite above requires
+// ../server once at the top with THEME UNSET in this process, giving us the
+// default THEME-OFF `app`. To exercise the THEME-ON path we need a SECOND app
+// instance built with THEME set. loadThemedApp() does that hermetically: it
+// snapshots the cached server module, briefly sets process.env.THEME, drops the
+// module from require's cache so a fresh require re-runs server.js with THEME
+// visible, then restores BOTH process.env.THEME and the ORIGINAL cached module
+// object. That last step is what keeps every other test untouched -- the
+// top-level `app` and require.cache are left exactly as they were, still
+// THEME-off. (Mirrors the care the F14 test takes with its environment.)
+const THEME_LINK = `<link rel="stylesheet" href="/theme.css?ver=1">`;
+const THEME_NAME = "red-black";
+
+function loadThemedApp() {
+	const serverPath = require.resolve("../server");
+	const originalModule = require.cache[serverPath];
+	const hadTheme = "THEME" in process.env;
+	const savedTheme = process.env.THEME;
+
+	process.env.THEME = THEME_NAME;
+	delete require.cache[serverPath];
+	const themedApp = require("../server");
+
+	// Restore env + the pristine cached module so the rest of the suite still
+	// sees the original THEME-off `app` and an unmodified require cache.
+	if (hadTheme) process.env.THEME = savedTheme;
+	else delete process.env.THEME;
+	require.cache[serverPath] = originalModule;
+
+	return themedApp;
+}
+
+const themedApp = loadThemedApp();
+
+test("F16: /theme.css serves the active theme sheet as text/css, no-cache, when THEME is set", async () => {
+	const res = await request(themedApp).get("/theme.css").buffer(true);
+	assert.equal(res.status, 200);
+	assert.match(res.headers["content-type"], /text\/css/);
+	assert.equal(res.headers["cache-control"], "no-cache");
+	const expected = fs.readFileSync(path.join(__dirname, "..", "themes", `${THEME_NAME}.css`), "utf8");
+	assert.equal(res.text, expected);
+});
+
+test("F16: THEME injects exactly one theme <link> immediately before </head> on / and a clean room URL", async () => {
+	// The clean room URL is the headline case: it has no matching <name>.html,
+	// so it resolves through the SPA fallback to index.html -- which must still
+	// be themed, not left un-themed while only real pages get the <link>.
+	for (const url of ["/", "/someRoom"]) {
+		const res = await request(themedApp).get(url).buffer(true);
+		assert.equal(res.status, 200);
+		assert.match(res.headers["content-type"], /html/);
+		assert.equal(res.headers["cache-control"], "no-cache");
+		// Exactly once, and immediately before the first </head>.
+		assert.equal(res.text.split(THEME_LINK).length - 1, 1);
+		assert.ok(res.text.includes(`${THEME_LINK}</head>`));
+	}
+});
+
+test("F16: a standalone tool page is themed AND its .html still 302-redirects to the clean URL", async () => {
+	const themed = await request(themedApp).get("/mixer").buffer(true);
+	assert.equal(themed.status, 200);
+	assert.match(themed.headers["content-type"], /html/);
+	assert.ok(themed.text.includes(`${THEME_LINK}</head>`));
+
+	// Injection sits AFTER the clean-URL redirect, so /mixer.html must still 302
+	// to /mixer (query preserved) instead of being served/injected directly.
+	const redirect = await request(themedApp).get("/mixer.html?foo=1");
+	assert.equal(redirect.status, 302);
+	assert.equal(redirect.headers.location, "/mixer?foo=1");
+});
+
+test("F16: non-HTML assets are served untouched under THEME (no injected link, correct type)", async () => {
+	const res = await request(themedApp).get("/lib.js?ver=1415").buffer(true);
+	assert.equal(res.status, 200);
+	assert.match(res.headers["content-type"], /javascript/);
+	assert.ok(!res.text.includes(THEME_LINK));
+});
+
+test("F16: with THEME unset (default app) /theme.css 404s and no theme link is injected", async () => {
+	// Proves zero behavior change when the feature is off: the middleware isn't
+	// even registered on the default `app`.
+	assert.equal((await request(app).get("/theme.css")).status, 404);
+
+	const home = await request(app).get("/").buffer(true);
+	assert.equal(home.status, 200);
+	assert.ok(!home.text.includes(THEME_LINK));
+});
+
+test("F16: the deny-list still wins under THEME (server internals + themes/ stay 404)", async () => {
+	// Injection runs after the deny-list, so a blocked internal is never
+	// read-and-injected. themes/ itself is off the static path (see BLOCKED_
+	// PREFIXES), so /theme.css is the only route to a theme file.
+	assert.equal((await request(themedApp).get("/server.js")).status, 404);
+	assert.equal((await request(themedApp).get("/themes/red-black.css")).status, 404);
+});

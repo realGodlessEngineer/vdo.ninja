@@ -1,0 +1,11 @@
+/*
+ * F16 PLACEHOLDER -- theme MECHANISM plumbing only.
+ *
+ * This file exists so the /theme.css route and the server-side HTML injection
+ * (both in server.js, gated on the THEME env var) have something real to serve
+ * and can be exercised/tested now. F17 REPLACES this file's contents with the
+ * full red-on-black palette -- do NOT build the real palette here.
+ */
+:root {
+	--vdo-theme-placeholder: 1;
+}
