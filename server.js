@@ -96,6 +96,19 @@ app.use((req, res, next) => {
 	next();
 });
 
+// F11: opt-in, dependency-free access log -- silent by default so self-hosters
+// get a quiet server, set LOG_REQUESTS=true to get a line per request for debugging.
+if (config.logRequests) {
+	app.use((req, res, next) => {
+		const start = process.hrtime.bigint();
+		res.on("finish", () => {
+			const ms = Number(process.hrtime.bigint() - start) / 1e6;
+			console.log(`${req.method} ${req.originalUrl} ${res.statusCode} ${ms.toFixed(1)}ms`);
+		});
+		next();
+	});
+}
+
 // ---------------------------------------------------------------------------
 // Error responses (F6): one content-negotiated helper reused by both 404
 // sites below and the final error handler at the bottom of the file. An HTML
