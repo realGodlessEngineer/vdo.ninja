@@ -434,4 +434,20 @@ if (require.main === module) {
 		else console.error("Server failed to start:", err);
 		process.exit(1);
 	});
+
+	// Drain in-flight requests instead of dropping them when an orchestrator
+	// stops this process -- Docker, Kubernetes, systemd, and most PaaS
+	// platforms send SIGTERM on deploy/scale-down; a developer's Ctrl-C sends
+	// SIGINT. server.close() stops accepting new connections and only calls
+	// back once every in-flight request has finished, so the exit below is a
+	// clean one. The timer is a force-exit backstop for a request that never
+	// finishes; .unref() is required so the timer itself doesn't keep the
+	// event loop alive and block the clean exit it's there to back up.
+	for (const sig of ["SIGTERM", "SIGINT"]) {
+		process.on(sig, () => {
+			console.log(`${sig} received — shutting down.`);
+			server.close(() => process.exit(0));
+			setTimeout(() => process.exit(1), 10000).unref();
+		});
+	}
 }
