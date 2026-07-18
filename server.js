@@ -420,7 +420,18 @@ app.use((err, req, res, next) => {
 module.exports = app;
 
 if (require.main === module) {
-	app.listen(config.port, config.host, () => {
+	const server = app.listen(config.port, config.host, () => {
 		console.log(`VDO.Ninja client serving on http://${config.host === "0.0.0.0" ? "localhost" : config.host}:${config.port}`);
+	});
+
+	// Without this, a bind failure (port already in use, or insufficient
+	// privileges to bind a low port) surfaces as an unhandled "error" event --
+	// a raw stack trace instead of a clear, actionable message -- and Node
+	// exits with a non-obvious code. Name the failure mode and exit cleanly.
+	server.on("error", err => {
+		if (err.code === "EADDRINUSE") console.error(`Port ${config.port} is already in use.`);
+		else if (err.code === "EACCES") console.error(`Insufficient privileges to bind port ${config.port}.`);
+		else console.error("Server failed to start:", err);
+		process.exit(1);
 	});
 }
