@@ -221,6 +221,19 @@ test("F16: /theme.css serves the active theme sheet as text/css, no-cache, when 
 	assert.equal(res.text, expected);
 });
 
+// F17 — the real red/black palette shipped, not the F16 mechanism placeholder.
+// Deliberately loose: it asserts the durable core signal (the red accent hex and
+// a remap of the highest-frequency neutral-ramp token) and the absence of the
+// placeholder marker, rather than exact bytes, so palette tuning does not make it
+// brittle while a regression to the placeholder fails loudly.
+test("F17: /theme.css ships the red/black palette, not the placeholder", async () => {
+	const res = await request(themedApp).get("/theme.css").buffer(true);
+	assert.equal(res.status, 200);
+	assert.ok(!res.text.includes("--vdo-theme-placeholder"), "placeholder token must be gone");
+	assert.match(res.text, /#ff3b3b/i, "red accent must be present");
+	assert.match(res.text, /--discord-grey-7:/, "neutral ramp must be remapped");
+});
+
 test("F16: THEME injects exactly one theme <link> immediately before </head> on / and a clean room URL", async () => {
 	// The clean room URL is the headline case: it has no matching <name>.html,
 	// so it resolves through the SPA fallback to index.html -- which must still

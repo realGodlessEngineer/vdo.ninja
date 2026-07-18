@@ -1,11 +1,253 @@
 /*
- * F16 PLACEHOLDER -- theme MECHANISM plumbing only.
+ * F17 -- VDO.Ninja "red-black" theme overlay.
  *
- * This file exists so the /theme.css route and the server-side HTML injection
- * (both in server.js, gated on the THEME env var) have something real to serve
- * and can be exercised/tested now. F17 REPLACES this file's contents with the
- * full red-on-black palette -- do NOT build the real palette here.
+ * Served at /theme.css when the server is launched with THEME=red-black, and
+ * injected by the F16 mechanism (server.js) as a single <link> before </head>
+ * of every served HTML page. This file is the ONLY thing F17 changes: it
+ * replaces the F16 mechanism placeholder with the real red-on-black palette.
+ *
+ * Strategy (see docs/NODEJS_AUDIT.md 3.1 and 3.5-3.7): main.css is only ~32%
+ * tokenized, so a semantic-only :root override repaints the base background but
+ * misses most surfaces. This sheet instead remaps the HIGH-FREQUENCY levers --
+ * the --discord-grey-* neutral ramp (toward near-black), the accent/link tokens
+ * (toward red), and the semantic surface tokens -- and adds a short list of
+ * targeted overrides for the few hardcoded-hex hotspots the ramp cannot reach
+ * (the blue .gobutton call-to-action, the #header glass bar, the blue chat-send
+ * border, and the focus ring). It reuses the client's own token cascade and
+ * .darktheme machinery rather than repainting all ~595 hex literals.
+ *
+ * This sheet is injected AFTER main.css, so its plain :root block (specificity
+ * 0,1,0) wins on source order over BOTH of main.css's :root blocks (line ~1 and
+ * the later refresh block at ~7175) and over the @media (prefers-color-scheme:
+ * dark) :root at ~7218 -- no !important needed for token remaps.
+ *
+ * Only tokens VERIFIED to exist AND be consumed in main.css are remapped. The
+ * --director-box / --codirector-box / --director-dark-box / --codirector-dark-box
+ * / --darktheme-red tokens are defined in main.css but never referenced by any
+ * css/html/js, so remapping them would be dead weight and they are intentionally
+ * left alone. The director / co-director customizer blocks are actually coloured
+ * through --blue-accent / --green-accent / --olive-accent / --red-accent
+ * (.directorBlock:nth-child(n)), which ARE remapped below.
+ *
+ * TRANSPARENT / CLEANOUTPUT / OBS SAFETY (audit 3.7 point 6): &transparent makes
+ * a Browser Source see-through by setting --background-color and --container-color
+ * to #0000 as INLINE styles on document.documentElement, plus an inline
+ * transparent background on #main (main.js ~3757-3766). An inline style beats a
+ * selector rule of equal importance, so the token remaps below deliberately use
+ * NO !important and this sheet sets NO hard background-color on html, body, or
+ * #main. All backgrounds are driven purely through token remaps.
+ *
+ * IMPORTANT: because this sheet sets --color-mode: dark, main.js auto-applies the
+ * .darktheme body class on index/room (see the coverage note below). Under
+ * .darktheme the stock client paints the body from --dark-background-color
+ * (main.css ~1888), which &transparent does NOT neutralize -- so left alone, a
+ * non-OBS transparent embed would go opaque. To preserve transparency this sheet
+ * overrides body.darktheme's background to track --background-color instead (the
+ * token &transparent DOES set to #0000 inline on documentElement); see the
+ * body.darktheme rule below. Transparent / clean output therefore still win
+ * exactly as they do in the stock client, in BOTH OBS and non-OBS embeds.
+ *
+ * Self-contained and inert: no @import, no url(), no web fonts, no network refs.
+ *
+ * Palette is the audit's WCAG-checked set (3.5): body text ~18:1 (AAA), dim text
+ * ~9.8:1, red accent #ff3b3b ~5.6:1 (AA), black-on-#ff3b3b buttons ~5.9:1 (AA --
+ * both the .gobutton CTA and the chat-send button), panel body-links #ff5a5a
+ * ~4.6:1 (AA on the grey-7 primary surface).
+ *
+ * Note on coverage: this sheet sets --color-mode: dark, which main.js reads
+ * (~4777) when no &darkmode/&lightmode param is present and the page is not OBS
+ * studioSoftware -- it then AUTO-APPLIES the .darktheme body class on index/room,
+ * in both OS light and dark modes. So a bare THEME=red-black deployment now gets
+ * full red-on-black coverage of the complex components (chat body, landing cards,
+ * director panels) out of the box; operators no longer need to add &darkmode to
+ * reach it. (&lightmode / &whitemode still opt out; OBS Browser Sources are exempt
+ * because studioSoftware forces darkmode off, and their transparency is preserved
+ * by the body.darktheme background override described in the safety note above.)
  */
+
 :root {
-	--vdo-theme-placeholder: 1;
+	/* red/black palette (audit 3.5) */
+	--vb-bg: #0a0a0c;
+	--vb-surface: #161619;
+	--vb-surface-2: #1f1f24;
+	--vb-border: #2a2a30;
+	--vb-text: #f5f5f7;
+	--vb-text-dim: #b8b8c0;
+	--vb-red: #ff3b3b;
+	--vb-red-hover: #ff5a5a;
+	--vb-red-strong: #c81e2c;
+
+	/* semantic surface tokens -- NO !important, so transparent mode's inline
+	   --background-color / --container-color overrides still win */
+	--background-color: var(--vb-bg);
+	--dark-background-color: #050506;
+	--container-color: var(--vb-surface);
+	--button-color: var(--vb-surface-2);
+	--color-mode: dark;
+
+	/* --gray90 is referenced by body{ color } but never defined upstream, so
+	   base body text is otherwise near-black on the new black background */
+	--gray90: var(--vb-text);
+
+	/* --light-grey is only ever a chip background and --near-black is only ever
+	   the text on that chip (main.css:6278-6280); flip them together so the chip
+	   becomes a dark surface with legible light text */
+	--light-grey: var(--vb-surface-2);
+	--near-black: var(--vb-text);
+
+	/* neutral ramp -- the highest-leverage tokens (grey-7 x12, grey-5 x8,
+	   grey-1 x5) -- shifted toward near-black */
+	--discord-grey-0: #050506;
+	--discord-grey-1: #0d0d10;
+	--discord-grey-2: #131316;
+	--discord-grey-3: #17171b;
+	--discord-grey-4: #1c1c21;
+	--discord-grey-5: #212127;
+	--discord-grey-6: #26262d;
+	--discord-grey-7: #2b2b33; /* primary surface */
+	--discord-grey-8: #3a3a44; /* borders on dark surfaces */
+	--discord-text: var(--vb-text);
+
+	/* accents -- red where it reads as action, neutral-dark where the stock
+	   client used stray blue/green/olive (the four .directorBlock backgrounds
+	   stay mutually distinguishable while sitting on-scheme) */
+	--red-accent: var(--vb-red-strong);
+	--blue-accent: #2a2436;
+	--green-accent: #243026;
+	--olive-accent: #2f2b20;
+	--darktheme-blue: #33232f;
+	--darktheme-green: #24302a;
+
+	/* --accent-color drives the chat send button (black text ~5.9:1 on #ff3b3b),
+	   range sliders, toggles and native form accents */
+	--accent-color: var(--vb-red);
+	--accent-hover-color: var(--vb-red-hover);
+
+	/* Link tokens toward red -- --a-dark-link alone is referenced x8. Both the
+	   dark family (used under .darktheme) and the base family (used without it,
+	   where the stock dark-blue would be low-contrast on black) are remapped.
+	   Resting + visited use --vb-red-hover (#ff5a5a), NOT --vb-red (#ff3b3b):
+	   body-links inside cards/columns/container-inner sit on the grey-7 primary
+	   surface (#2b2b33), where #ff3b3b is only 3.97:1 (fails AA-normal) while
+	   #ff5a5a is 4.59:1 (AA) and stays AA on the darker bg/surfaces (>=5.3:1).
+	   Hover/focus go a shade brighter (#ff6b6b, 5.06:1 on grey-7) to keep a hover
+	   cue now that the resting shade equals the old hover; active stays the strong
+	   red. --vb-red/#ff3b3b remains the accent/button token, so the neon-on-black
+	   look is unchanged. */
+	--a-dark-link: var(--vb-red-hover);
+	--a-dark-visited: var(--vb-red-hover);
+	--a-dark-hover: #ff6b6b;
+	--a-dark-focus: #ff6b6b;
+	--a-dark-active: var(--vb-red-strong);
+
+	--a-link: var(--vb-red-hover);
+	--a-visited: var(--vb-red-hover);
+	--a-hover: #ff6b6b;
+	--a-focus: #ff6b6b;
+	--a-active: var(--vb-red-strong);
+
+	/* lighter/darker link families are used inside .directorContainer and
+	   .infoblob; keep them on-scheme so those panels do not show blue links */
+	--a-lighter-link: #ff6b6b;
+	--a-lighter-visited: #ff6b6b;
+	--a-lighter-hover: var(--vb-red-hover);
+	--a-lighter-focus: var(--vb-red-hover);
+	--a-lighter-active: var(--vb-red);
+
+	--a-darker-link: #ff6b6b;
+	--a-darker-visited: #ff6b6b;
+	--a-darker-hover: #ff8585;
+	--a-darker-focus: #ff8585;
+	--a-darker-active: var(--vb-red);
+}
+
+/*
+ * Targeted overrides for hardcoded-hex hotspots and cascade edge-cases the token
+ * ramp cannot reach. The only html / body / #main background these touch is the
+ * body.darktheme rule below, which is deliberately routed through
+ * --background-color so &transparent / &cleanoutput stay see-through (see the
+ * transparent-safety note in the header); the rest are inert with respect to
+ * compositing.
+ */
+
+/* --color-mode: dark makes main.js auto-apply .darktheme (see header notes), and
+   stock main.css:1888 then paints the body from --dark-background-color, which
+   &transparent does NOT neutralize. Route the dark body through --background-color
+   instead -- the token &transparent sets to #0000 inline on documentElement.
+   Normal value resolves to --vb-bg (#0a0a0c, imperceptibly different from the old
+   #050506); under &transparent it inherits the inline #0000 so the embed stays
+   see-through. Equal specificity (0,1,1) to main.css:1888, injected later -> wins. */
+body.darktheme {
+	background-color: var(--background-color);
+}
+
+/* Base generic <button> for the no-.darktheme case: set background AND text
+   together (no dark-on-dark risk). The client's higher-specificity darktheme
+   button rule still wins under .darktheme, and .gobutton / .chatBarInputButton /
+   button.grey keep their own more-specific styling. */
+button {
+	background-color: var(--vb-surface-2);
+	color: var(--vb-text);
+	border: 1px solid var(--vb-border);
+}
+
+/* .gobutton is the primary join/action CTA. main.css's "Primary CTA harmony"
+   block forces BOTH background-color: var(--accent-color) !important (hover
+   var(--accent-hover-color) !important, main.css:7607/7611) AND
+   border-color: #2f7ec4 !important (blue, main.css:7608/7612). This theme remaps
+   the background to --vb-red / --vb-red-hover -- so the button ALWAYS renders on
+   #ff3b3b (base) / #ff5a5a (hover) regardless of this rule's own (non-important)
+   background. Use BLACK text: black-on-#ff3b3b = 5.94:1 and black-on-#ff5a5a =
+   6.86:1 (both WCAG AA), matching how .chatBarInputButton already reads (white
+   text would have been 3.53:1 / 3.06:1 -- FAIL). The reds declared here MATCH
+   what main.css forces, so the result stays AA even if a downstream fork drops
+   the !important CTA block. The border is likewise forced by main.css's
+   !important, so re-force it red with !important (equal specificity, later in
+   source -> wins) -- same technique as #header / .chatBarInputButton -- otherwise
+   the red/black CTA renders an off-palette blue 2px ring. */
+.gobutton,
+.darktheme .gobutton {
+	background-color: var(--vb-red);
+	color: #000;
+	border: 2px solid var(--vb-red);
+	border-color: var(--vb-red) !important;
+}
+.gobutton:hover,
+.darktheme .gobutton:hover {
+	background-color: var(--vb-red-hover);
+	border-color: var(--vb-red-hover) !important;
+}
+
+/* main.css:257-258 hardcodes color:black on the audioSource <option> children and
+   forces their background to var(--light-grey) !important, which this theme flips
+   to a dark surface (#1f1f24) -- leaving black-on-#1f1f24 (1.28:1, unreadable).
+   Re-light the option text (f5f5f7 on #1f1f24 = 15:1). Same selector/specificity
+   as main.css, injected later, non-important color -> wins (the background stays
+   main.css's !important --light-grey). */
+.darktheme select#audioSource[size="1"] option {
+	color: var(--vb-text);
+}
+
+/* #header is a hardcoded rgba glass bar (client uses !important on both the base
+   and .darktheme rules); match specificity + !important, later in source, to
+   retint it near-black and tie it into the theme with a faint red hairline.
+   Header chrome is hidden under &cleanoutput and is never the capture surface. */
+#header,
+.darktheme #header {
+	background-color: rgba(10, 10, 12, 0.72) !important;
+	border-bottom: 1px solid rgba(255, 59, 59, 0.35);
+}
+
+/* The chat send button already goes red via --accent-color; kill its leftover
+   hardcoded blue border. */
+.chatBarInputButton {
+	border-color: var(--vb-red-strong) !important;
+}
+
+/* Visible red focus ring for keyboard navigation (additive: the client's a:focus
+   rules only set color, so this does not fight them). */
+a:focus-visible,
+button:focus-visible {
+	outline: 2px solid var(--vb-red);
+	outline-offset: 2px;
 }
