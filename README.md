@@ -62,6 +62,8 @@ If self-hosting, you might also wish to host your own video relay TURN server.  
 
 For users wishing to host VDO.Ninja offline (where no Internet is available), there's a repository with everything needed to deploy locally and offline here: https://github.com/steveseguin/offline_deployment. The offline version includes a Docker option, and there are some community-created Dockers available for online hosting. I may eventually offer an official Docker option designed for online users with heavier requirements, but I lack time and support to maintain such a project currently.
 
+If you're using the included `server.js` to self-host, its Cache-Control policy always revalidates HTML while serving long-lived, cacheable responses for assets requested with a `?ver=`/`?v=` cache-busting query, so a CDN or reverse proxy cache can safely sit in front of the static tier without risking stale scripts.
+
 ### Develop vs Release versions
 
 The develop branch of this repo is a bit like the preview or nightly version of VDO.Ninja. It's intended to be functional, but it may not be that well tested, or there could be incomplete features. The develop version aligns closely with what is normally on vdo.ninja/alpha/, which is well suited for those wishing to submit code changes or to gain access to experimental new features. You can access a hosted version of the GitHub develop branch on Github pages here as well: https://steveseguin.github.io/vdo.ninja/

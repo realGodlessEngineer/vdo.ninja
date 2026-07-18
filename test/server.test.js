@@ -15,7 +15,7 @@ const app = require("../server");
 
 test("clean-url redirect preserves the query string", async () => {
 	const res = await request(app).get("/mixer.html?foo=1");
-	assert.equal(res.status, 302);
+	assert.equal(res.status, 301);
 	assert.equal(res.headers.location, "/mixer?foo=1");
 });
 
@@ -44,7 +44,7 @@ test("F1 regression: a protocol-relative //host.html path is never redirected of
 	// redirect route steps aside (next()) and the request falls through to the
 	// deny-list / static handler / SPA fallback, none of which know this path
 	// -> 404. Assert that concretely, not just "no bad Location", so removing
-	// the guard (which would 302 instead) fails this test outright.
+	// the guard (which would 301 instead) fails this test outright.
 	assert.equal(res.status, 404);
 	if (res.headers.location) {
 		assert.doesNotMatch(res.headers.location, /^\/\//);
@@ -249,16 +249,16 @@ test("F16: THEME injects exactly one theme <link> immediately before </head> on 
 	}
 });
 
-test("F16: a standalone tool page is themed AND its .html still 302-redirects to the clean URL", async () => {
+test("F16: a standalone tool page is themed AND its .html still 301-redirects to the clean URL", async () => {
 	const themed = await request(themedApp).get("/mixer").buffer(true);
 	assert.equal(themed.status, 200);
 	assert.match(themed.headers["content-type"], /html/);
 	assert.ok(themed.text.includes(`${THEME_LINK}</head>`));
 
-	// Injection sits AFTER the clean-URL redirect, so /mixer.html must still 302
+	// Injection sits AFTER the clean-URL redirect, so /mixer.html must still 301
 	// to /mixer (query preserved) instead of being served/injected directly.
 	const redirect = await request(themedApp).get("/mixer.html?foo=1");
-	assert.equal(redirect.status, 302);
+	assert.equal(redirect.status, 301);
 	assert.equal(redirect.headers.location, "/mixer?foo=1");
 });
 

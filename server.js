@@ -241,7 +241,7 @@ app.get(/\.html$/, (req, res, next) => {
 	}
 	const queryIndex = req.originalUrl.indexOf("?");
 	const query = queryIndex >= 0 ? req.originalUrl.slice(queryIndex) : "";
-	res.redirect(302, clean + query);
+	res.redirect(301, clean + query);
 });
 
 // Deny-list internal files that happen to live inside ROOT (see the comment on
@@ -388,7 +388,7 @@ app.use((req, res, next) => {
 //
 // Placement is load-bearing (this sits after the deny-list above and before
 // the precompressed-asset middleware / express.static / SPA fallback below):
-//   * AFTER the /foo.html -> /foo redirect, so a *.html request still 302s to
+//   * AFTER the /foo.html -> /foo redirect, so a *.html request still 301s to
 //     its clean URL first -- the clean-URL redirect (and its test) is
 //     untouched. This middleware only themes the extensionless clean/room URLs
 //     that redirect produces; it never serves a *.html path itself.
@@ -603,7 +603,7 @@ function cacheControlFor(filePath, req) {
 // extensions (e.g. /lib.js, /main.css) -- resolving a clean/extensionless URL
 // (e.g. /mixer -> mixer.html) to its precompressed variant is intentionally
 // out of scope. In practice that also makes the ".html" entry below mostly
-// theoretical: the clean-URL redirect route earlier in this file 302s every
+// theoretical: the clean-URL redirect route earlier in this file 301s every
 // same-origin "*.html" request to its extensionless form before it can ever
 // reach here, so a real client essentially never hits the ".html" branch
 // directly. It's kept anyway for the same-shape edge case that redirect route
