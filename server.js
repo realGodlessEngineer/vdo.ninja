@@ -68,6 +68,7 @@ const config = {
 	turnServer: process.env.TURN_SERVER || null,
 	signalingHost: process.env.SIGNALING_HOST || null,
 	brandName: process.env.BRAND_NAME || "VDO.Ninja",
+	brandVersion: process.env.BRAND_VERSION || null,
 	theme: process.env.THEME || null,
 	logRequests: process.env.LOG_REQUESTS === "true"
 };
@@ -136,9 +137,13 @@ function sendError(req, res, status, heading, body) {
 // Health check for the hosting platform's uptime probes. The body changes
 // every call (uptime) and monitoring systems must always see the live
 // status, so tell every cache (browser, proxy, CDN) not to store this at all.
+// `ok` is kept for back-compat with anything already asserting on it;
+// `status`/`version` are F15's enrichment for human/dashboard consumption.
+// `version` is null unless BRAND_VERSION is set at deploy time -- this repo
+// has no build step to stamp a version into, so it's operator-supplied.
 app.get("/healthz", (req, res) => {
 	res.setHeader("Cache-Control", "no-store");
-	res.json({ ok: true, uptime: process.uptime() });
+	res.json({ ok: true, status: "ok", uptime: process.uptime(), version: config.brandVersion });
 });
 
 // Example: expose deploy-time config to the client from environment variables.

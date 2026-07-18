@@ -92,6 +92,20 @@ test("F13 regression: dot-prefixed paths 404, including percent-encoded ones", a
 	assert.match(cleanRoom.headers["content-type"], /html/);
 });
 
+// F15 regression: /healthz is enriched with `status` and `version` alongside
+// the pre-existing `ok`/`uptime`, for human/dashboard consumption. `version`
+// is null here because the test process doesn't set BRAND_VERSION.
+test("F15: /healthz reports ok, status, uptime, and version", async () => {
+	const res = await request(app).get("/healthz");
+	assert.equal(res.status, 200);
+	assert.match(res.headers["content-type"], /json/);
+	assert.equal(res.headers["cache-control"], "no-store");
+	assert.equal(res.body.ok, true);
+	assert.equal(res.body.status, "ok");
+	assert.equal(typeof res.body.uptime, "number");
+	assert.equal(res.body.version, null);
+});
+
 // F14 regression: deploy-time precompression (scripts/precompress.js) is
 // served instead of paying the on-the-fly compression() cost, with F3's
 // Cache-Control policy still intact on that path.
