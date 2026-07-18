@@ -417,6 +417,10 @@ app.use((err, req, res, next) => {
 	sendError(req, res, 500, "Server error", "Something went wrong — please try again.");
 });
 
-app.listen(config.port, config.host, () => {
-	console.log(`VDO.Ninja client serving on http://${config.host === "0.0.0.0" ? "localhost" : config.host}:${config.port}`);
-});
+module.exports = app;
+
+if (require.main === module) {
+	app.listen(config.port, config.host, () => {
+		console.log(`VDO.Ninja client serving on http://${config.host === "0.0.0.0" ? "localhost" : config.host}:${config.port}`);
+	});
+}
