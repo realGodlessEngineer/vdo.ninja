@@ -403,7 +403,23 @@ app.use(
 // instead of being masked by a 200 HTML page.
 app.use((req, res) => {
 	const hasFileExtension = path.extname(req.path) !== "";
-	if (req.method === "GET" && !hasFileExtension && req.accepts("html")) {
+	// A dot-prefixed path segment (/.gitignore, /.env, or a nested one like
+	// /.git/config) is never a legit SPA route -- exclude it here so it 404s
+	// instead of reading as a misleading 200 to scanners. Checked against every
+	// segment, not just the basename, since /.git/config's final segment
+	// ("config") isn't itself dot-prefixed. Decoded first -- like
+	// normalizeForDenylist() above -- so a percent-encoded variant (e.g.
+	// /%2egitignore) can't hide its leading dot from req.path's raw, undecoded
+	// segments. dotfiles:"ignore" above already stops the real file content
+	// from being served; this just keeps the status code honest too.
+	let decodedPath;
+	try {
+		decodedPath = decodeURIComponent(req.path);
+	} catch {
+		decodedPath = req.path; // malformed % escape; compare the raw path instead of throwing
+	}
+	const isDotPath = decodedPath.split("/").some(segment => segment.startsWith("."));
+	if (req.method === "GET" && !hasFileExtension && !isDotPath && req.accepts("html")) {
 		// res.sendFile() does NOT go through express.static's setHeaders above,
 		// so it needs the same "HTML holds the ?ver= pointers" no-cache policy
 		// set explicitly here or this fallback would silently miss it.

@@ -71,3 +71,17 @@ test("F3: a version-stamped asset is long-cached, HTML is always revalidated", a
 	assert.equal(html.status, 200);
 	assert.equal(html.headers["cache-control"], "no-cache");
 });
+
+// F13 regression: dot-prefixed paths never fall back to the misleading 200
+// index.html a scanner would otherwise see, including a percent-encoded dot
+// (%2e) -- a standard scanner/WAF evasion that bypassed a naive raw-req.path
+// string check.
+test("F13 regression: dot-prefixed paths 404, including percent-encoded ones", async () => {
+	assert.equal((await request(app).get("/.git/config")).status, 404);
+	assert.equal((await request(app).get("/.gitignore")).status, 404);
+	assert.equal((await request(app).get("/%2egitignore")).status, 404);
+
+	const cleanRoom = await request(app).get("/someRoomName");
+	assert.equal(cleanRoom.status, 200);
+	assert.match(cleanRoom.headers["content-type"], /html/);
+});
