@@ -158,7 +158,14 @@ app.get("/config.js", (req, res) => {
 	// still lets res.send()'s auto-generated ETag do its job: unchanged config
 	// comes back as a cheap 304 with no body instead of a full re-send every time.
 	res.setHeader("Cache-Control", "no-cache");
-	res.send(`window.CUSTOM_CONFIG = ${JSON.stringify(clientConfig)};`);
+	// JSON.stringify leaves <, U+2028, and U+2029 unescaped: an unescaped "<" matters if this
+	// is ever inlined into HTML (</script> breakout), and U+2028/U+2029 are literal JS line
+	// terminators that would break the script if an operator-controlled value contained one.
+	const json = JSON.stringify(clientConfig)
+		.replace(/</g, "\\u003c")
+		.replace(/\u2028/g, "\\u2028")
+		.replace(/\u2029/g, "\\u2029");
+	res.send(`window.CUSTOM_CONFIG = ${json};`);
 });
 
 // ---------------------------------------------------------------------------
