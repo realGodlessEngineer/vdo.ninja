@@ -8,7 +8,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "test": "node --test"
+    "test": "node --test",
+    "precompress": "node scripts/precompress.js"
   },
   "engines": {
     "node": ">=18"

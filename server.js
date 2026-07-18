@@ -198,6 +198,10 @@ app.get(/\.html$/, (req, res, next) => {
 // next() for a match — because the SPA fallback further down serves
 // index.html (200) for any unmatched, extensionless GET, and an extensionless
 // blocked path like /node_modules/express would otherwise fall through to it.
+// scripts/precompress.js's NEVER_COMPRESS set mirrors the file-name entries
+// below (not the directory ones, which it already skips via its own
+// EXCLUDED_DIR_NAMES) so it never wastes a deploy step compressing a file
+// that will never be served anyway. Keep the two lists in sync.
 const BLOCKED_EXACT = new Set([
 	"/server.js",
 	"/package.json",
@@ -220,8 +224,16 @@ const BLOCKED_EXACT_LIST = [...BLOCKED_EXACT];
 // (see `extensions: ["html"]` below), and blocking it would 404 that page
 // for every forker who clones this repo (docs.html is tracked; only the
 // contents of docs/ are gitignored). Bare "/node_modules" is covered by
-// BLOCKED_EXACT above.
-const BLOCKED_PREFIXES = ["/node_modules/", "/docs/"]; // this dir and everything under it
+// BLOCKED_EXACT above. "/scripts/" (F14's deploy tooling, e.g.
+// scripts/precompress.js) is the same class of "server-side ops file, not a
+// client asset" as the two above -- and since F14's precompressed-asset
+// middleware runs AFTER this one, blocking the prefix here also stops a
+// stray scripts/precompress.js.br/.gz from being served, without that
+// middleware needing its own awareness of the deny-list. No "scripts.html"
+// exists at the repo root, so unlike "/docs" there's no clean-URL page this
+// would shadow -- bare "/scripts" is deliberately left unblocked/unlisted
+// for the same reason "/docs" is.
+const BLOCKED_PREFIXES = ["/node_modules/", "/docs/", "/scripts/"]; // this dir and everything under it
 
 // Reduces a raw request path to a canonical form for comparison against the
 // deny-list above, closing the path-normalization tricks that would otherwise
@@ -369,6 +381,166 @@ function hasVersionParam(req) {
 	return req.query != null && (req.query.ver !== undefined || req.query.v !== undefined);
 }
 
+// The F3 Cache-Control decision itself, factored out so both express.static's
+// setHeaders below and the precompressed-asset middleware above it apply the
+// *exact* same policy from one place -- otherwise the two paths could drift
+// out of sync (e.g. a precompressed response getting a different Cache-Control
+// than the identical, non-precompressed response would have gotten).
+// `filePath` must always be the ORIGINAL asset's path (e.g. "…/lib.js"), never
+// a precompressed variant's ("…/lib.js.br") -- the ".html" check below would
+// misfire on "mixer.html.br" otherwise.
+function cacheControlFor(filePath, req) {
+	if (filePath.endsWith(".html")) {
+		// HTML carries the ?ver=/?v= pointers into the assets above it, so
+		// caching HTML would pin visitors to old asset versions and quietly
+		// defeat the whole cache-busting scheme -- always revalidate it.
+		return "no-cache";
+	}
+	return hasVersionParam(req) ? `public, max-age=${VERSIONED_ASSET_MAX_AGE_SECONDS}` : "no-cache";
+}
+
+// ---------------------------------------------------------------------------
+// Precompressed asset serving (F14)
+// ---------------------------------------------------------------------------
+// `scripts/precompress.js` writes maximum-quality brotli (q11) and gzip (-9)
+// siblings ("<file>.br" / "<file>.gz") for the repo's large text assets as a
+// deploy step (see that file's header comment). This middleware serves those
+// precomputed bytes directly instead of paying the on-the-fly compression()
+// CPU cost (quality 4) on every cache miss.
+//
+// Placement matters: this MUST run after the deny-list middleware above (a
+// blocked path -- server.js itself, node_modules/, docs/ -- must never be
+// served just because scripts/precompress.js happened to produce a .br/.gz
+// sibling for it) and BEFORE express.static (a hit here skips the filesystem
+// stat + on-the-fly compression express.static/compression() would otherwise
+// do).
+//
+// Scope: this only ever handles a DIRECTLY-requested file with one of these
+// extensions (e.g. /lib.js, /main.css) -- resolving a clean/extensionless URL
+// (e.g. /mixer -> mixer.html) to its precompressed variant is intentionally
+// out of scope. In practice that also makes the ".html" entry below mostly
+// theoretical: the clean-URL redirect route earlier in this file 302s every
+// same-origin "*.html" request to its extensionless form before it can ever
+// reach here, so a real client essentially never hits the ".html" branch
+// directly. It's kept anyway for the same-shape edge case that redirect route
+// itself carves out (a non-same-origin-looking "*.html" path that steps aside
+// via next() instead of redirecting) and so this map stays a uniform,
+// unsurprising list of "every text extension this server serves" rather than
+// silently special-casing HTML out. Either way, HTML is small and already
+// `no-cache`, so the win there is negligible -- see CLAUDE.md task notes.
+// Those requests, and any request for a file with no precompressed sibling,
+// fall through untouched to express.static + compression() below, exactly as
+// before.
+//
+// Values captured live from this project's installed `mime-types`@2.1.35 (the
+// same mime lookup `send`/express.static uses internally -- see
+// node_modules/send/index.js's `type()` method, which does
+// `mime.lookup(path)` + `mime.charsets.lookup(type)`), so a precompressed
+// response gets an identical Content-Type to what the equivalent
+// non-precompressed response would have gotten. Hardcoded here instead of
+// `require("mime-types")` so this file has no *implicit* dependency on
+// express's transitive dependency tree keeping that exact shape -- this
+// project otherwise takes no new npm dependencies (see CLAUDE.md). Keep this
+// object's keys in sync with scripts/precompress.js's COMPRESSIBLE_EXTENSIONS.
+const PRECOMPRESSED_CONTENT_TYPES = {
+	".js": "application/javascript; charset=UTF-8",
+	".css": "text/css; charset=UTF-8",
+	".html": "text/html; charset=UTF-8",
+	".svg": "image/svg+xml",
+	".json": "application/json; charset=UTF-8"
+};
+
+// Preferred-first: brotli compresses smaller than gzip from the same source,
+// so prefer it whenever a client's Accept-Encoding allows both.
+const PRECOMPRESSED_VARIANTS = [
+	{ suffix: ".br", encoding: "br" },
+	{ suffix: ".gz", encoding: "gzip" }
+];
+
+app.use((req, res, next) => {
+	if (req.method !== "GET" && req.method !== "HEAD") {
+		return next();
+	}
+
+	const contentType = PRECOMPRESSED_CONTENT_TYPES[path.extname(req.path).toLowerCase()];
+	if (!contentType) {
+		return next();
+	}
+
+	// Resolve the same way express.static would: ROOT + the decoded,
+	// path-normalized request path. Re-derived independently here (rather
+	// than trusting req.path) as defense-in-depth against traversal, matching
+	// the posture of normalizeForDenylist() above -- res.sendFile() below
+	// enforces no containment of its own for an already-absolute path (that
+	// guarantee only applies when callers use its `root` option instead), so
+	// this middleware is the thing keeping `filePath` inside ROOT.
+	let decodedPath;
+	try {
+		decodedPath = decodeURIComponent(req.path);
+	} catch {
+		return next(); // malformed % escape -- let express.static produce the right response
+	}
+	const filePath = path.normalize(path.join(ROOT, decodedPath));
+	if (filePath !== ROOT && !filePath.startsWith(ROOT + path.sep)) {
+		return next();
+	}
+
+	const variant = PRECOMPRESSED_VARIANTS.find(candidate => req.acceptsEncodings(candidate.encoding) === candidate.encoding);
+	if (!variant) {
+		return next(); // client doesn't accept br or gzip -- let normal serving handle it
+	}
+
+	// All headers are threaded through res.sendFile's `headers` option rather
+	// than set eagerly via res.setHeader beforehand, so they're only ever
+	// applied once `send` (used internally by res.sendFile) has confirmed the
+	// variant file actually exists -- see node_modules/send/index.js:
+	// SendStream#setHeader emits the 'headers' event (which this populates)
+	// before SendStream#type() sets Content-Type, and SendStream#type() skips
+	// its own mime lookup once Content-Type is already set -- so this Content-
+	// Type is never clobbered. The same ordering means `send`'s own default
+	// Cache-Control (gated on `!res.getHeader('Cache-Control')`) never fires
+	// either, since ours is already set by the time it checks. ETag and
+	// Last-Modified are deliberately left for `send` to compute itself, from
+	// the variant file's own fs.Stats -- keeping conditional-GET/304 support
+	// correct and tied to the bytes actually being served, not the original
+	// file.
+	res.sendFile(
+		filePath + variant.suffix,
+		{
+			headers: {
+				"Content-Type": contentType,
+				"Content-Encoding": variant.encoding,
+				// Tells any shared cache (browser, CDN, proxy) that the response
+				// body depends on Accept-Encoding, so it never hands this br/gzip
+				// body to a client that can't decode it.
+				Vary: "Accept-Encoding",
+				"Cache-Control": cacheControlFor(filePath, req)
+			}
+		},
+		err => {
+			if (!err) {
+				return; // response already sent
+			}
+			// ENOENT: no precompressed sibling on disk. err.status/err.statusCode
+			// === 404: `send` (which res.sendFile() uses internally) raises its OWN
+			// 404 for reasons besides ENOENT -- e.g. its built-in dotfile guard,
+			// which fires on the *last path segment* of the file being sent and has
+			// no `.code` property, only `.status`/`.statusCode` (confirmed against
+			// this project's installed `send`/`http-errors`: a bare res.sendFile()
+			// call with no `dotfiles` option treats a dotfile the same as
+			// `dotfiles: "ignore"` by default). Either way, `send` has already
+			// decided this specific variant path should look like "not found" --
+			// fall through to normal serving the same way, so the ORIGINAL path
+			// gets a consistent response (its own 404, or a real file) instead of
+			// this middleware turning a 404-shaped outcome into a 500.
+			if (err.code === "ENOENT" || err.status === 404 || err.statusCode === 404) {
+				return next();
+			}
+			next(err); // unexpected (permissions, I/O, ...) -- let the final error handler respond
+		}
+	);
+});
+
 // Serve real files. `extensions: ["html"]` makes /mixer resolve to mixer.html;
 // `index` serves index.html for directory roots.
 app.use(
@@ -377,22 +549,13 @@ app.use(
 		index: "index.html",
 		dotfiles: "ignore",
 		setHeaders(res, filePath) {
-			if (filePath.endsWith(".html")) {
-				// HTML carries the ?ver=/?v= pointers into the assets above it, so
-				// caching HTML would pin visitors to old asset versions and quietly
-				// defeat the whole cache-busting scheme -- always revalidate it.
-				res.setHeader("Cache-Control", "no-cache");
-			} else if (hasVersionParam(res.req)) {
-				// send/serve-static invoke setHeaders with the real http.ServerResponse,
-				// which Node populates with a `.req` back-reference to the original
-				// request (see the Node docs for response.req) -- and because Express
-				// mutates that same request object's prototype/properties in place
-				// rather than copying it, res.req here is the fully-Express-augmented
-				// request, `.query` included.
-				res.setHeader("Cache-Control", `public, max-age=${VERSIONED_ASSET_MAX_AGE_SECONDS}`);
-			} else {
-				res.setHeader("Cache-Control", "no-cache");
-			}
+			// send/serve-static invoke setHeaders with the real http.ServerResponse,
+			// which Node populates with a `.req` back-reference to the original
+			// request (see the Node docs for response.req) -- and because Express
+			// mutates that same request object's prototype/properties in place
+			// rather than copying it, res.req here is the fully-Express-augmented
+			// request, `.query` included.
+			res.setHeader("Cache-Control", cacheControlFor(filePath, res.req));
 		}
 	})
 );
