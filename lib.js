@@ -5822,7 +5822,7 @@ function setupIncomingScreenTracking(v, UUID) {
 		} else {
 			// group scene I guess; needs to be added manually
 			v.style.display = "none";
-			v.mutedStateScene = true;
+			session.rpcs[UUID].mutedStateScene = true;
 		}
 
 		setTimeout(function () {
@@ -55165,6 +55165,12 @@ session.onTrack = function (event, UUID) {
 		sendFrameHandler(newTracks, UUID);
 	}
 
+	if (audioAdded && session.scene !== false && !session.view && session.scene !== "0" && session.rpcs[UUID].videoElement && session.rpcs[UUID].videoElement.style.display === "none" && !(session.autoadd && session.rpcs[UUID].streamID && session.autoadd.includes(session.rpcs[UUID].streamID))) {
+		// re-assert group-scene auto-mute on (re)connect: setupIncomingVideoTracking (mutedStateScene) only runs at element creation, so a reused/renegotiated element is otherwise never re-muted
+		session.rpcs[UUID].mutedStateScene = true;
+		applyMuteState(UUID);
+	}
+
 	if (audioAdded && videoAdded) {
 		updateIncomingVideoElement(UUID);
 	} else if (videoAdded) {
@@ -55719,9 +55725,12 @@ function updateIncomingVideoElement(UUID, video = true, audio = true) {
 		if (!video) {
 			if (session.rpcs[UUID] && session.rpcs[UUID].videoElement) {
 				// this bit of code fixes an issue where the volume button doesn't show, after adding an audio track for the first time
+				// preserve usermuted across the internal toggle so this app-owned flip can never latch usermuted and permanently disable applyMuteState
 				var pastMuteState = session.rpcs[UUID].videoElement.muted;
+				var pastUserMuted = session.rpcs[UUID].videoElement.usermuted;
 				session.rpcs[UUID].videoElement.muted = !pastMuteState;
 				session.rpcs[UUID].videoElement.muted = pastMuteState;
+				session.rpcs[UUID].videoElement.usermuted = pastUserMuted;
 			}
 		}
 	}
