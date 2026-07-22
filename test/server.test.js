@@ -286,3 +286,145 @@ test("F16: the deny-list still wins under THEME (server internals + themes/ stay
 	assert.equal((await request(themedApp).get("/server.js")).status, 404);
 	assert.equal((await request(themedApp).get("/themes/red-black.css")).status, 404);
 });
+
+// ---------------------------------------------------------------------------
+// F18 — server-gated /director link dispensing.
+// ---------------------------------------------------------------------------
+// Like THEME, server.js reads DIRECTOR_SECRET / DIRECTOR_ROOM / ROOM_PASSWORD /
+// ROOM_KEY exactly once at require time into its `config`. The top-level `app`
+// was required with all four UNSET, so it has the feature OFF -- reused directly
+// by the "disabled" test below. loadDirectorApp() builds a fresh app instance
+// with a chosen env hermetically, mirroring loadThemedApp() above: it snapshots
+// the cached server module, sets the requested env vars (deleting any the caller
+// omits), re-requires server.js so it re-reads the env, then restores BOTH the
+// env and the original cached module so the rest of the suite is untouched.
+const DIRECTOR_ENV_KEYS = ["DIRECTOR_SECRET", "DIRECTOR_ROOM", "ROOM_PASSWORD", "ROOM_KEY"];
+
+function loadDirectorApp(env) {
+	const serverPath = require.resolve("../server");
+	const originalModule = require.cache[serverPath];
+	const saved = {};
+	for (const key of DIRECTOR_ENV_KEYS) {
+		saved[key] = key in process.env ? process.env[key] : undefined;
+		if (env[key] === undefined) delete process.env[key];
+		else process.env[key] = env[key];
+	}
+
+	delete require.cache[serverPath];
+	const directorApp = require("../server");
+
+	for (const key of DIRECTOR_ENV_KEYS) {
+		if (saved[key] === undefined) delete process.env[key];
+		else process.env[key] = saved[key];
+	}
+	require.cache[serverPath] = originalModule;
+
+	return directorApp;
+}
+
+// Encodes an HTTP Basic "Authorization" header value for a supplied password
+// (username is irrelevant to the check, so it's left blank).
+function basicAuth(password) {
+	return `Basic ${Buffer.from(`:${password}`).toString("base64")}`;
+}
+
+test("F18: with DIRECTOR_SECRET unset the /director route is absent (falls through, no 401, no director redirect)", async () => {
+	// Default `app` has the feature off, so /director is just a clean URL: it
+	// falls through to the SPA fallback (there is no director.html) -> 200 index.
+	const res = await request(app).get("/director");
+	assert.notEqual(res.status, 401);
+	assert.notEqual(res.status, 302);
+	assert.equal(res.status, 200);
+	assert.match(res.headers["content-type"], /html/);
+});
+
+test("F18: enabled but no Authorization header -> 401 with WWW-Authenticate", async () => {
+	const directorApp = loadDirectorApp({ DIRECTOR_SECRET: "s3cret", DIRECTOR_ROOM: "greenroom" });
+	const res = await request(directorApp).get("/director");
+	assert.equal(res.status, 401);
+	assert.match(res.headers["www-authenticate"], /^Basic /);
+});
+
+test("F18: enabled with a wrong password -> 401", async () => {
+	const directorApp = loadDirectorApp({ DIRECTOR_SECRET: "s3cret", DIRECTOR_ROOM: "greenroom" });
+	const res = await request(directorApp).get("/director").set("Authorization", basicAuth("wrong"));
+	assert.equal(res.status, 401);
+});
+
+test("F18: enabled with a supplied password of a DIFFERENT length than the secret does not throw -> 401", async () => {
+	// Guards the constant-time-compare contract: hashing both sides to a fixed
+	// 32-byte width is what stops crypto.timingSafeEqual from throwing on
+	// mismatched-length inputs. A raw compare here would 500, not 401.
+	const directorApp = loadDirectorApp({ DIRECTOR_SECRET: "short", DIRECTOR_ROOM: "greenroom" });
+	const res = await request(directorApp).get("/director").set("Authorization", basicAuth("a-much-longer-password-than-the-secret"));
+	assert.equal(res.status, 401);
+});
+
+test("F18: enabled, correct password, no ROOM_KEY -> 302 to /?director=<ROOM>; password only in the fragment; no requireapproval", async () => {
+	const directorApp = loadDirectorApp({ DIRECTOR_SECRET: "s3cret", DIRECTOR_ROOM: "green room", ROOM_PASSWORD: "hunter2" });
+	const res = await request(directorApp).get("/director").set("Authorization", basicAuth("s3cret"));
+	assert.equal(res.status, 302);
+
+	const location = res.headers.location;
+	const hashIndex = location.indexOf("#");
+	assert.notEqual(hashIndex, -1, "a password is set, so there must be a fragment");
+	const beforeHash = location.slice(0, hashIndex);
+	const afterHash = location.slice(hashIndex + 1);
+
+	// Query part: director room only, no requireapproval (ROOM_KEY unset).
+	assert.equal(beforeHash, `/?director=${encodeURIComponent("green room")}`);
+	assert.ok(!beforeHash.includes("requireapproval"), "no ROOM_KEY -> no requireapproval");
+
+	// The secret must NOT leak into the query string, only the fragment.
+	assert.ok(!beforeHash.includes("password="), "password must not appear before '#'");
+	assert.ok(!beforeHash.includes("hunter2"), "password value must not appear before '#'");
+	assert.equal(afterHash, `password=${encodeURIComponent("hunter2")}`);
+});
+
+test("F18: enabled, correct password, ROOM_KEY set -> requireapproval in query; password + roomkey only in the fragment", async () => {
+	const directorApp = loadDirectorApp({ DIRECTOR_SECRET: "s3cret", DIRECTOR_ROOM: "greenroom", ROOM_PASSWORD: "hunter2", ROOM_KEY: "let me in" });
+	const res = await request(directorApp).get("/director").set("Authorization", basicAuth("s3cret"));
+	assert.equal(res.status, 302);
+
+	const location = res.headers.location;
+	const hashIndex = location.indexOf("#");
+	assert.notEqual(hashIndex, -1);
+	const beforeHash = location.slice(0, hashIndex);
+	const afterHash = location.slice(hashIndex + 1);
+
+	// Query part: director room + requireapproval (present iff ROOM_KEY set).
+	assert.equal(beforeHash, "/?director=greenroom&requireapproval");
+
+	// Neither secret leaks into the query string.
+	assert.ok(!beforeHash.includes("password="), "password must not appear before '#'");
+	assert.ok(!beforeHash.includes("hunter2"), "password value must not appear before '#'");
+	assert.ok(!beforeHash.includes("roomkey="), "roomkey must not appear before '#'");
+	assert.ok(!beforeHash.includes("let me in") && !beforeHash.includes(encodeURIComponent("let me in")), "roomkey value must not appear before '#'");
+
+	// Both secrets live in the fragment, encodeURIComponent'd.
+	assert.equal(afterHash, `password=${encodeURIComponent("hunter2")}&roomkey=${encodeURIComponent("let me in")}`);
+});
+
+test("F18: ROOM_KEY set with no ROOM_PASSWORD -> fragment carries only roomkey and requireapproval is present", async () => {
+	const directorApp = loadDirectorApp({ DIRECTOR_SECRET: "s3cret", DIRECTOR_ROOM: "greenroom", ROOM_KEY: "rk123" });
+	const res = await request(directorApp).get("/director").set("Authorization", basicAuth("s3cret"));
+	assert.equal(res.status, 302);
+	assert.equal(res.headers.location, "/?director=greenroom&requireapproval#roomkey=rk123");
+});
+
+test("F18: no ROOM_PASSWORD and no ROOM_KEY -> plain /?director=<ROOM> with no fragment at all", async () => {
+	const directorApp = loadDirectorApp({ DIRECTOR_SECRET: "s3cret", DIRECTOR_ROOM: "greenroom" });
+	const res = await request(directorApp).get("/director").set("Authorization", basicAuth("s3cret"));
+	assert.equal(res.status, 302);
+	assert.equal(res.headers.location, "/?director=greenroom");
+});
+
+test("F18: DIRECTOR_SECRET set but DIRECTOR_ROOM unset disables the feature (route absent, falls through to 200)", async () => {
+	// Same "secret without a room" disable-and-warn posture as an invalid THEME.
+	const directorApp = loadDirectorApp({ DIRECTOR_SECRET: "s3cret" });
+	const res = await request(directorApp).get("/director");
+	assert.notEqual(res.status, 401);
+	assert.notEqual(res.status, 302);
+	assert.equal(res.status, 200);
+	assert.match(res.headers["content-type"], /html/);
+});

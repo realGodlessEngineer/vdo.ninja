@@ -16,6 +16,7 @@
 
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 const express = require("express");
 const compression = require("compression");
 
@@ -71,7 +72,19 @@ const config = {
 	brandName: process.env.BRAND_NAME || "VDO.Ninja",
 	brandVersion: process.env.BRAND_VERSION || null,
 	theme: process.env.THEME || null,
-	logRequests: process.env.LOG_REQUESTS === "true"
+	logRequests: process.env.LOG_REQUESTS === "true",
+	// F18 (server-gated director link). DIRECTOR_SECRET/DIRECTOR_ROOM gate the
+	// feature and are trimmed because trailing whitespace in an env var is
+	// almost always an accident and would silently change the auth password /
+	// break the room name. ROOM_PASSWORD/ROOM_KEY are the credentials baked into
+	// the dispensed link; they are NOT trimmed -- the room password is folded
+	// byte-for-byte into the room's hashed identity (see lib.js), so the
+	// director and every guest must use the exact same value, whitespace
+	// included. Empty (or unset) means "not set" for all four.
+	directorSecret: (process.env.DIRECTOR_SECRET || "").trim(),
+	directorRoom: (process.env.DIRECTOR_ROOM || "").trim(),
+	roomPassword: process.env.ROOM_PASSWORD || null,
+	roomKey: process.env.ROOM_KEY || null
 };
 
 try {
@@ -93,6 +106,19 @@ try {
 const THEME_NAME = config.theme && /^[a-zA-Z0-9_-]+$/.test(config.theme) ? config.theme : null;
 if (config.theme && !THEME_NAME) {
 	console.warn(`Ignoring THEME=${JSON.stringify(config.theme)}: theme names may contain only letters, digits, "-" and "_".`);
+}
+
+// F18: the server-gated /director route is only active when BOTH DIRECTOR_SECRET
+// (the auth password that guards the link) AND DIRECTOR_ROOM (the room to
+// direct) are set. Mirrors THEME_NAME's gate: when this is false the route below
+// is never registered, so /director simply falls through to the SPA fallback
+// like any other clean URL -- the feature is genuinely absent, not just inert. A
+// secret with no room can't produce a usable link, so that combination disables
+// the feature and is announced once, the same posture as the invalid-THEME
+// warning above.
+const DIRECTOR_ENABLED = config.directorSecret !== "" && config.directorRoom !== "";
+if (config.directorSecret !== "" && config.directorRoom === "") {
+	console.warn(`Ignoring DIRECTOR_SECRET: the server-gated director link also requires DIRECTOR_ROOM (the room name to direct) to be set.`);
 }
 
 // gzip responses. lib.js (~2MB) and webrtc.js (~700KB) compress dramatically.
@@ -220,6 +246,77 @@ app.get("/theme.css", (req, res, next) => {
 		}
 	);
 });
+
+// ---------------------------------------------------------------------------
+// F18: server-gated director link.
+// ---------------------------------------------------------------------------
+// Honest model: this server only serves static files, so it CANNOT enforce the
+// VDO.Ninja "director" role itself. All it does here is DISPENSE the privileged
+// director link after an HTTP Basic auth check; the real director enforcement
+// (room claim, guest approval, roomkey) is done by the signaling server
+// (wss.vdo.ninja by default), not by this process. No client change is needed
+// -- the route only assembles existing URL params onto a redirect that the
+// stock client already understands.
+//
+// The redirect target is built ENTIRELY from server env vars (never from any
+// request input -- no query, path, or header is incorporated), so there is no
+// open-redirect risk. Secret params (the room password and roomkey) go in the
+// URL "#" fragment rather than the query string: the fragment is never sent to
+// the server on the follow-up GET and is not captured by F11's optional access
+// log, whereas the query string would be. Gated on DIRECTOR_ENABLED so the
+// route is absent unless the operator opted in with DIRECTOR_SECRET +
+// DIRECTOR_ROOM.
+if (DIRECTOR_ENABLED) {
+	// Hash the secret once at boot. The per-request compare hashes the supplied
+	// password to the same fixed 32-byte width, so crypto.timingSafeEqual never
+	// sees mismatched-length buffers (which would make it throw) regardless of
+	// what length the client sends.
+	const directorSecretHash = crypto.createHash("sha256").update(config.directorSecret).digest();
+
+	app.get("/director", (req, res) => {
+		const authorizationHeader = req.headers.authorization || "";
+		const basicMatch = /^Basic (.+)$/i.exec(authorizationHeader);
+		let authorized = false;
+		if (basicMatch) {
+			// Buffer.from(..., "base64") never throws (it silently drops invalid
+			// characters), so a malformed credential just yields a string that
+			// won't contain the right password -> 401.
+			const decoded = Buffer.from(basicMatch[1], "base64").toString("utf8");
+			const separatorIndex = decoded.indexOf(":");
+			// Accept ANY username; compare ONLY the password (everything after the
+			// first ":"). A credential with no ":" carries no password -> 401.
+			if (separatorIndex !== -1) {
+				const suppliedPassword = decoded.slice(separatorIndex + 1);
+				const suppliedHash = crypto.createHash("sha256").update(suppliedPassword).digest();
+				authorized = crypto.timingSafeEqual(suppliedHash, directorSecretHash);
+			}
+		}
+
+		if (!authorized) {
+			res.setHeader("WWW-Authenticate", 'Basic realm="Director"');
+			return sendError(req, res, 401, "Authentication required", "Provide the director credentials to obtain the director link.");
+		}
+
+		// Non-secret params (the room name, and the non-sensitive &requireapproval
+		// flag) in the query string; secret params (password, roomkey) in the "#"
+		// fragment. Every interpolated value is env-derived and encodeURIComponent'd.
+		let location = `/?director=${encodeURIComponent(config.directorRoom)}`;
+		if (config.roomKey) {
+			location += "&requireapproval";
+		}
+		const fragmentParams = [];
+		if (config.roomPassword) {
+			fragmentParams.push(`password=${encodeURIComponent(config.roomPassword)}`);
+		}
+		if (config.roomKey) {
+			fragmentParams.push(`roomkey=${encodeURIComponent(config.roomKey)}`);
+		}
+		if (fragmentParams.length) {
+			location += `#${fragmentParams.join("&")}`;
+		}
+		res.redirect(302, location);
+	});
+}
 
 // ---------------------------------------------------------------------------
 // STATIC FILE SERVING (production-like URL behavior)
