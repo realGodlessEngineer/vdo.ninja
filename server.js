@@ -84,7 +84,16 @@ const config = {
 	directorSecret: (process.env.DIRECTOR_SECRET || "").trim(),
 	directorRoom: (process.env.DIRECTOR_ROOM || "").trim(),
 	roomPassword: process.env.ROOM_PASSWORD || null,
-	roomKey: process.env.ROOM_KEY || null
+	roomKey: process.env.ROOM_KEY || null,
+	// F22 (opt-in per-IP rate limiter). A positive integer is the sliding-
+	// window requests-per-minute allowance per client IP. Note `|| 0` alone
+	// does NOT fully normalize this to "0 means off": Number.parseInt("-5", 10)
+	// is -5, and -5 is truthy, so a negative env value survives as a negative
+	// number here rather than becoming 0. That's fine -- RATE_LIMIT_ENABLED
+	// below (the thing the middleware registration actually gates on) treats
+	// zero, negative, unset, and non-numeric identically via `> 0`, so this
+	// field is only ever consulted once already known to be a positive count.
+	rateLimitRpm: Number.parseInt(process.env.RATE_LIMIT_RPM, 10) || 0
 };
 
 try {
@@ -121,6 +130,20 @@ if (config.directorSecret !== "" && config.directorRoom === "") {
 	console.warn(`Ignoring DIRECTOR_SECRET: the server-gated director link also requires DIRECTOR_ROOM (the room name to direct) to be set.`);
 }
 
+// F22: the opt-in per-IP rate limiter (registered further below, after the F11
+// access-log middleware, so a throttled request is still access-logged) is
+// active only when RATE_LIMIT_RPM parsed to a positive requests-per-minute
+// count above. Computed here, alongside THEME_NAME/DIRECTOR_ENABLED, so every
+// "is this optional feature on" flag lives in one place. Mirrors those two:
+// when this is false the middleware is never registered at all, so the
+// feature is genuinely absent -- not merely inert -- the same posture as
+// /director being absent (not just always-401) when DIRECTOR_ENABLED is
+// false.
+const RATE_LIMIT_ENABLED = config.rateLimitRpm > 0;
+if (process.env.RATE_LIMIT_RPM !== undefined && process.env.RATE_LIMIT_RPM.trim() !== "" && !RATE_LIMIT_ENABLED) {
+	console.warn(`Ignoring RATE_LIMIT_RPM=${JSON.stringify(process.env.RATE_LIMIT_RPM)}: must be a positive integer (requests per minute, per IP) to enable the rate limiter.`);
+}
+
 // gzip responses. lib.js (~2MB) and webrtc.js (~700KB) compress dramatically.
 app.use(compression());
 
@@ -152,6 +175,98 @@ if (config.logRequests) {
 }
 
 // ---------------------------------------------------------------------------
+// F22: opt-in, in-memory, per-IP request-rate limiter.
+// ---------------------------------------------------------------------------
+// Off unless RATE_LIMIT_ENABLED (RATE_LIMIT_RPM set to a positive integer,
+// see the config block above) -- when it's false NOTHING below is registered,
+// so the feature costs nothing on every self-hosted deploy that never opts
+// in. This is a lightweight, dependency-free abuse/DoS backstop for a plain
+// VPS deploy with nothing else in front of it, not a replacement for a real
+// edge layer -- this is equally self-hostable behind Cloudflare or another
+// CDN/WAF, and an operator who already has one there should generally rate-
+// limit *there* instead, where it's cheaper (blocked before it ever reaches
+// this process) and not reset by a restart or split across multiple
+// instances the way this in-process Map is.
+//
+// IMPORTANT for operators: a single browser page load fans out into MANY
+// requests -- index.html, lib.js, webrtc.js, adapter.js, aes.js, CSS, icons,
+// manifest.json, translations/*.json, and so on -- and this limiter counts
+// EVERY request, not just "actions". Set RATE_LIMIT_RPM generously (a few
+// hundred, not a handful) or normal page loads will start 429ing.
+//
+// Sliding-window-log algorithm, keyed on req.ip: a Map<ip, timestamps[]>
+// holds each IP's request times within the trailing RATE_LIMIT_WINDOW_MS. On
+// every request, timestamps older than the window are dropped first; if the
+// count remaining is already at the limit, the request is rejected (429) and
+// its timestamp is NOT recorded, so a well-behaved client's own window keeps
+// draining while it backs off and it recovers within RATE_LIMIT_WINDOW_MS --
+// only requests that were actually ALLOWED get logged.
+//
+// req.ip's correctness depends entirely on the already-configured
+// `trust proxy` setting (config.trustProxy, applied near the top of this
+// file from TRUST_PROXY): too permissive for the real topology and a client
+// can spoof X-Forwarded-For to get a fresh bucket per request (defeating the
+// limiter); too strict (or a real proxy in front with trust proxy left at
+// the "loopback" default) and every distinct client behind that proxy
+// collapses into a single shared bucket (one abusive client throttles
+// everyone else behind the same proxy). That's the operator's TRUST_PROXY to
+// get right for their deploy, not something this middleware can detect or
+// correct.
+const RATE_LIMIT_WINDOW_MS = 60_000;
+
+if (RATE_LIMIT_ENABLED) {
+	// ip -> ascending-order timestamps (ms since epoch) of requests ALLOWED
+	// within the trailing window. A plain Map, not an LRU/TTL cache, because
+	// the periodic sweep below is what keeps it bounded instead.
+	const rateLimitBuckets = new Map();
+
+	// Without this sweep, an IP's entry would sit in the Map forever once
+	// created -- one entry per distinct IP ever seen, unbounded over a long-
+	// running process's lifetime, even though the per-request pruning below
+	// already empties out an IDLE ip's array on its next visit. This instead
+	// proactively drops entries for IPs that never come back: on the same
+	// cadence as the window itself, delete any bucket whose newest recorded
+	// timestamp has already aged out. `.unref()` is required so this timer
+	// can never keep the event loop (and so the process) alive on its own --
+	// it must not interfere with the SIGTERM/SIGINT graceful-drain path near
+	// the bottom of this file.
+	const sweepInterval = setInterval(() => {
+		const cutoff = Date.now() - RATE_LIMIT_WINDOW_MS;
+		for (const [ip, timestamps] of rateLimitBuckets) {
+			const newest = timestamps[timestamps.length - 1];
+			if (newest === undefined || newest < cutoff) {
+				rateLimitBuckets.delete(ip);
+			}
+		}
+	}, RATE_LIMIT_WINDOW_MS);
+	sweepInterval.unref();
+
+	app.use((req, res, next) => {
+		// Platform uptime probes must never be throttled. Match the same set the
+		// health route serves (Express non-strict routing answers /healthz and
+		// /healthz/), so the trailing-slash form is exempt too.
+		if (req.path === "/healthz" || req.path === "/healthz/") return next();
+
+		const ip = req.ip || "unknown";
+		const now = Date.now();
+		const cutoff = now - RATE_LIMIT_WINDOW_MS;
+
+		const timestamps = (rateLimitBuckets.get(ip) || []).filter(t => t > cutoff);
+
+		if (timestamps.length >= config.rateLimitRpm) {
+			rateLimitBuckets.set(ip, timestamps); // keep the pruned array even when rejecting
+			const retryAfterSeconds = Math.max(1, Math.ceil((timestamps[0] + RATE_LIMIT_WINDOW_MS - now) / 1000));
+			res.setHeader("Retry-After", String(retryAfterSeconds));
+			return sendError(req, res, 429, "Too many requests", "You’ve made too many requests recently — please slow down and try again shortly.");
+		}
+
+		timestamps.push(now);
+		rateLimitBuckets.set(ip, timestamps);
+		next();
+	});
+}
+
+// ---------------------------------------------------------------------------
 // Error responses (F6): one content-negotiated helper reused by both 404
 // sites below and the final error handler at the bottom of the file. An HTML
 // client (req.accepts("html")) gets a minimal, accessible, self-contained
@@ -160,14 +275,19 @@ if (config.logRequests) {
 // consumer) gets a small JSON body instead. `heading` and `body` are always
 // hardcoded string literals passed by the call sites in this file, never
 // request data (URL, headers, params, query) -- keep it that way, or this
-// becomes a reflected-XSS sink.
+// becomes a reflected-XSS sink. The JSON `error` label is looked up from
+// `status` via the map below (not derived from `heading`/`body`, which are
+// free-form prose) -- F22 added the 429 entry; anything without its own
+// entry still falls back to the generic "internal_error" label it always had.
 // ---------------------------------------------------------------------------
+const ERROR_LABELS_BY_STATUS = { 404: "not_found", 429: "rate_limited" };
+
 function sendError(req, res, status, heading, body) {
 	res.status(status);
 	if (req.accepts("html")) {
 		res.type("html").send(`<!doctype html><html lang="en"><head><meta charset="utf-8">` + `<meta name="viewport" content="width=device-width,initial-scale=1">` + `<title>${status} — ${heading}</title></head>` + `<body style="font-family:system-ui;max-width:40rem;margin:4rem auto;padding:0 1rem">` + `<h1>${status} — ${heading}</h1><p>${body} <a href="/">Return home</a>.</p></body></html>`);
 	} else {
-		res.json({ error: status === 404 ? "not_found" : "internal_error" });
+		res.json({ error: ERROR_LABELS_BY_STATUS[status] || "internal_error" });
 	}
 }
 

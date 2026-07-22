@@ -428,3 +428,114 @@ test("F18: DIRECTOR_SECRET set but DIRECTOR_ROOM unset disables the feature (rou
 	assert.equal(res.status, 200);
 	assert.match(res.headers["content-type"], /html/);
 });
+
+// ---------------------------------------------------------------------------
+// F22 — opt-in, in-memory, per-IP request-rate limiter.
+// ---------------------------------------------------------------------------
+// Same hermetic pattern as loadThemedApp()/loadDirectorApp() above: server.js
+// reads RATE_LIMIT_RPM (and, for the per-IP isolation test below, TRUST_PROXY)
+// into its frozen `config` exactly once at require time. The top-level `app`
+// was required with RATE_LIMIT_RPM unset, so it has the feature OFF -- reused
+// directly by the "disabled by default" test below. loadRateLimitedApp()
+// builds a fresh instance with a chosen env hermetically: snapshot the cached
+// module, set/delete the requested env vars, re-require server.js so it
+// re-reads them, then restore both the env and the original cached module so
+// the rest of the suite is untouched.
+const RATE_LIMIT_ENV_KEYS = ["RATE_LIMIT_RPM", "TRUST_PROXY"];
+
+function loadRateLimitedApp(env) {
+	const serverPath = require.resolve("../server");
+	const originalModule = require.cache[serverPath];
+	const saved = {};
+	for (const key of RATE_LIMIT_ENV_KEYS) {
+		saved[key] = key in process.env ? process.env[key] : undefined;
+		if (env[key] === undefined) delete process.env[key];
+		else process.env[key] = env[key];
+	}
+
+	delete require.cache[serverPath];
+	const limitedApp = require("../server");
+
+	for (const key of RATE_LIMIT_ENV_KEYS) {
+		if (saved[key] === undefined) delete process.env[key];
+		else process.env[key] = saved[key];
+	}
+	require.cache[serverPath] = originalModule;
+
+	return limitedApp;
+}
+
+test("F22: disabled by default -- with RATE_LIMIT_RPM unset, far more requests than any plausible limit all succeed", async () => {
+	// The default top-level `app` was required with RATE_LIMIT_RPM unset, so
+	// the middleware isn't even registered on it -- this proves zero behavior
+	// change for every self-hoster who never opts in.
+	for (let i = 0; i < 50; i++) {
+		const res = await request(app).get("/config.js");
+		assert.equal(res.status, 200);
+	}
+});
+
+test("F22: enabled -- the first N requests succeed and request N+1 is 429 with a Retry-After header and a rate_limited JSON body", async () => {
+	const limitedApp = loadRateLimitedApp({ RATE_LIMIT_RPM: "3" });
+
+	for (let i = 0; i < 3; i++) {
+		const res = await request(limitedApp).get("/config.js");
+		assert.equal(res.status, 200);
+	}
+
+	const blocked = await request(limitedApp).get("/config.js").set("Accept", "application/json");
+	assert.equal(blocked.status, 429);
+	assert.ok(blocked.headers["retry-after"], "Retry-After header must be present");
+	assert.ok(Number(blocked.headers["retry-after"]) > 0, "Retry-After must be a positive number of seconds");
+	assert.deepEqual(blocked.body, { error: "rate_limited" });
+});
+
+test("F22: /healthz is exempt from the limit even after the same IP is already throttled on other paths", async () => {
+	const limitedApp = loadRateLimitedApp({ RATE_LIMIT_RPM: "1" });
+
+	const first = await request(limitedApp).get("/config.js");
+	assert.equal(first.status, 200);
+	const throttled = await request(limitedApp).get("/config.js");
+	assert.equal(throttled.status, 429);
+
+	// Same client, repeatedly, on /healthz: always 200, never throttled.
+	for (let i = 0; i < 3; i++) {
+		const health = await request(limitedApp).get("/healthz");
+		assert.equal(health.status, 200);
+	}
+});
+
+test("F22: /healthz/ (trailing slash) is also exempt from the limit, since Express's non-strict routing serves it from the same /healthz route", async () => {
+	const limitedApp = loadRateLimitedApp({ RATE_LIMIT_RPM: "1" });
+
+	const first = await request(limitedApp).get("/config.js");
+	assert.equal(first.status, 200);
+	const throttled = await request(limitedApp).get("/config.js");
+	assert.equal(throttled.status, 429);
+
+	// Same client, repeatedly, on /healthz/: always 200, never throttled.
+	for (let i = 0; i < 3; i++) {
+		const health = await request(limitedApp).get("/healthz/");
+		assert.equal(health.status, 200);
+	}
+});
+
+// Confirms req.ip is genuinely derived from X-Forwarded-For under TRUST_PROXY
+// (not just from the underlying loopback socket every supertest request
+// actually comes from): the same XFF value used repeatedly gets throttled,
+// while a DIFFERENT XFF value is unaffected by that first client's usage --
+// which could only happen if each XFF value maps to its own bucket.
+test("F22: per-IP isolation -- one client IP being throttled does not affect a different client IP (TRUST_PROXY + X-Forwarded-For)", async () => {
+	const limitedApp = loadRateLimitedApp({ RATE_LIMIT_RPM: "2", TRUST_PROXY: "1" });
+
+	for (let i = 0; i < 2; i++) {
+		const res = await request(limitedApp).get("/config.js").set("X-Forwarded-For", "203.0.113.10");
+		assert.equal(res.status, 200);
+	}
+	const blockedFirstClient = await request(limitedApp).get("/config.js").set("X-Forwarded-For", "203.0.113.10");
+	assert.equal(blockedFirstClient.status, 429);
+
+	// A second, distinct client IP has its own untouched bucket.
+	const secondClient = await request(limitedApp).get("/config.js").set("X-Forwarded-For", "203.0.113.99");
+	assert.equal(secondClient.status, 200);
+});
