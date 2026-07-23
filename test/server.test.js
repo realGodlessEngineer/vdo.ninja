@@ -430,6 +430,82 @@ test("F18: DIRECTOR_SECRET set but DIRECTOR_ROOM unset disables the feature (rou
 });
 
 // ---------------------------------------------------------------------------
+// F-A / T1 — per-IP brute-force throttle on the /director Basic-auth endpoint.
+// ---------------------------------------------------------------------------
+// server.js hardcodes the throttle window/threshold INSIDE its
+// `if (DIRECTOR_ENABLED)` block (no env var, mirroring the F22 limiter): up to
+// DIRECTOR_AUTH_MAX_FAILURES failed password attempts per IP within a trailing
+// 15-minute window, then that IP is locked out (429 + Retry-After) for the rest
+// of the window; a correct password resets the counter. These tests cross the
+// threshold synchronously within the window -- every supertest request here
+// comes from the same loopback IP, i.e. one shared bucket -- so there are no
+// timers to wait on, and each loadDirectorApp() call is a fresh app with a
+// fresh, empty failure map. DIRECTOR_AUTH_MAX_FAILURES below must stay in sync
+// with the constant of the same name in server.js.
+const DIRECTOR_AUTH_MAX_FAILURES = 10;
+
+test("F-A/T1: repeated wrong passwords lock the IP out -- pre-threshold attempts 401, the threshold attempt 429 with a positive Retry-After", async () => {
+	const directorApp = loadDirectorApp({ DIRECTOR_SECRET: "s3cret", DIRECTOR_ROOM: "greenroom" });
+
+	// The first DIRECTOR_AUTH_MAX_FAILURES - 1 wrong attempts are ordinary 401s.
+	for (let i = 0; i < DIRECTOR_AUTH_MAX_FAILURES - 1; i++) {
+		const res = await request(directorApp).get("/director").set("Authorization", basicAuth("wrong"));
+		assert.equal(res.status, 401, `attempt ${i + 1} should still be 401`);
+	}
+
+	// The attempt that REACHES the cap is itself throttled: 429 + Retry-After,
+	// and the JSON body reuses sendError's shared 429 label.
+	const locking = await request(directorApp).get("/director").set("Authorization", basicAuth("wrong")).set("Accept", "application/json");
+	assert.equal(locking.status, 429);
+	assert.ok(Number(locking.headers["retry-after"]) > 0, "Retry-After must be a positive number of seconds");
+	assert.deepEqual(locking.body, { error: "rate_limited" });
+});
+
+test("F-A/T1: once locked out, even the CORRECT password is 429 -- lockout is not bypassable while locked", async () => {
+	const directorApp = loadDirectorApp({ DIRECTOR_SECRET: "s3cret", DIRECTOR_ROOM: "greenroom" });
+
+	// Drive it to the cap with wrong passwords.
+	for (let i = 0; i < DIRECTOR_AUTH_MAX_FAILURES; i++) {
+		await request(directorApp).get("/director").set("Authorization", basicAuth("wrong"));
+	}
+
+	// The password check is skipped entirely while locked, so the correct
+	// password gets 429, NOT a 302 redirect -- proving an attacker can't keep
+	// guessing and slip through the moment they hit the right value.
+	const correctWhileLocked = await request(directorApp).get("/director").set("Authorization", basicAuth("s3cret"));
+	assert.equal(correctWhileLocked.status, 429);
+	assert.notEqual(correctWhileLocked.status, 302);
+	assert.ok(Number(correctWhileLocked.headers["retry-after"]) > 0, "Retry-After must be a positive number of seconds");
+});
+
+test("F-A/T1: a correct password resets the counter -- earlier failures don't carry over, so it takes a full fresh threshold to lock out again", async () => {
+	const directorApp = loadDirectorApp({ DIRECTOR_SECRET: "s3cret", DIRECTOR_ROOM: "greenroom" });
+
+	// A few (below-threshold) wrong attempts...
+	for (let i = 0; i < DIRECTOR_AUTH_MAX_FAILURES - 1; i++) {
+		const res = await request(directorApp).get("/director").set("Authorization", basicAuth("wrong"));
+		assert.equal(res.status, 401);
+	}
+
+	// ...then one correct attempt succeeds (302) and clears this IP's bucket.
+	const success = await request(directorApp).get("/director").set("Authorization", basicAuth("s3cret"));
+	assert.equal(success.status, 302);
+
+	// The counter is back to zero: the next DIRECTOR_AUTH_MAX_FAILURES - 1 wrong
+	// attempts are all 401 again. Had the earlier failures persisted across the
+	// success, the very first of these would already be the threshold-th failure
+	// and 429 -- so a 401 here is what proves the reset happened.
+	for (let i = 0; i < DIRECTOR_AUTH_MAX_FAILURES - 1; i++) {
+		const res = await request(directorApp).get("/director").set("Authorization", basicAuth("wrong"));
+		assert.equal(res.status, 401, `post-reset attempt ${i + 1} should be 401, proving the counter restarted from zero`);
+	}
+
+	// Only the full fresh threshold of new failures locks out again.
+	const relock = await request(directorApp).get("/director").set("Authorization", basicAuth("wrong"));
+	assert.equal(relock.status, 429);
+});
+
+// ---------------------------------------------------------------------------
 // F22 — opt-in, in-memory, per-IP request-rate limiter.
 // ---------------------------------------------------------------------------
 // Same hermetic pattern as loadThemedApp()/loadDirectorApp() above: server.js

@@ -393,7 +393,75 @@ if (DIRECTOR_ENABLED) {
 	// what length the client sends.
 	const directorSecretHash = crypto.createHash("sha256").update(config.directorSecret).digest();
 
+	// F-A (CWE-307): per-IP failed-attempt throttle -- an in-process brute-force
+	// backstop for this HTTP Basic auth endpoint. This is NOT a substitute for a
+	// high-entropy DIRECTOR_SECRET (an operator who sets a guessable password is
+	// still exposed; see deploy-railway.md's "Director link" section, which
+	// requires a generated secret) -- it just caps how many guesses per IP an
+	// online attacker gets before being locked out. It reuses F22's sliding-
+	// window-log idiom exactly, but is deliberately NOT a global middleware:
+	// it's scoped to the /director handler only and keyed on FAILED attempts,
+	// not on all requests. It lives entirely inside `if (DIRECTOR_ENABLED)`, so
+	// -- like F22's map + sweep living inside `if (RATE_LIMIT_ENABLED)` -- it
+	// costs nothing and doesn't exist at all when the director feature is off.
+	//
+	// Hardcoded window/threshold (no new env var -- the config surface stays
+	// unchanged): allow up to DIRECTOR_AUTH_MAX_FAILURES failed passwords per IP
+	// within a trailing DIRECTOR_AUTH_WINDOW_MS, then lock that IP out for the
+	// rest of the window. 10 failures / 15 minutes is lax enough that a director
+	// who fat-fingers the password a few times is never affected, while cutting
+	// an online guessing attacker from effectively unlimited attempts down to a
+	// handful per window (~40/hour/IP). req.ip's correctness depends on the
+	// already-configured `trust proxy` setting exactly as F22 documents above --
+	// the same TRUST_PROXY caveat applies here and is the operator's to get
+	// right, not re-solved in this handler.
+	const DIRECTOR_AUTH_WINDOW_MS = 15 * 60_000; // 15 minutes
+	const DIRECTOR_AUTH_MAX_FAILURES = 10;
+
+	// ip -> ascending-order timestamps (ms since epoch) of FAILED auth attempts
+	// within the trailing window. A plain Map, kept bounded by the sweep below,
+	// exactly like F22's rateLimitBuckets. (A hard ceiling on this Map's size is
+	// deliberately out of scope here -- it's tracked as T4 and will be applied
+	// consistently across this map and F22's limiter.)
+	const directorAuthFailures = new Map();
+
+	// Same proactive sweep as F22's rate limiter: on the window cadence, delete
+	// any bucket whose newest recorded failure has already aged out, so an IP
+	// that stops guessing doesn't sit in the Map forever. `.unref()` is required
+	// so this timer can never keep the event loop (and so the process) alive on
+	// its own -- it must not interfere with the SIGTERM/SIGINT graceful-drain
+	// path near the bottom of this file.
+	const directorAuthSweep = setInterval(() => {
+		const cutoff = Date.now() - DIRECTOR_AUTH_WINDOW_MS;
+		for (const [ip, timestamps] of directorAuthFailures) {
+			const newest = timestamps[timestamps.length - 1];
+			if (newest === undefined || newest < cutoff) {
+				directorAuthFailures.delete(ip);
+			}
+		}
+	}, DIRECTOR_AUTH_WINDOW_MS);
+	directorAuthSweep.unref();
+
 	app.get("/director", (req, res) => {
+		const ip = req.ip || "unknown";
+		const now = Date.now();
+		const cutoff = now - DIRECTOR_AUTH_WINDOW_MS;
+
+		// Prune this IP's aged-out failures first, so the window slides.
+		const failures = (directorAuthFailures.get(ip) || []).filter(t => t > cutoff);
+
+		// Already at the cap -> locked out: refuse WITHOUT checking the password
+		// (this is what stops continued online brute-forcing) and WITHOUT
+		// recording a new timestamp (so the window keeps draining and a legit
+		// user recovers within DIRECTOR_AUTH_WINDOW_MS -- the same recovery
+		// property F22 documents). Retry-After via F22's exact formula.
+		if (failures.length >= DIRECTOR_AUTH_MAX_FAILURES) {
+			directorAuthFailures.set(ip, failures); // keep the pruned array even when rejecting
+			const retryAfterSeconds = Math.max(1, Math.ceil((failures[0] + DIRECTOR_AUTH_WINDOW_MS - now) / 1000));
+			res.setHeader("Retry-After", String(retryAfterSeconds));
+			return sendError(req, res, 429, "Too many attempts", "Too many failed authentication attempts — please wait and try again shortly.");
+		}
+
 		const authorizationHeader = req.headers.authorization || "";
 		const basicMatch = /^Basic (.+)$/i.exec(authorizationHeader);
 		let authorized = false;
@@ -413,9 +481,25 @@ if (DIRECTOR_ENABLED) {
 		}
 
 		if (!authorized) {
+			// Record this failed attempt in the sliding window, then decide the
+			// response. If pushing it just reached the cap, the attempt that hits
+			// the threshold is itself throttled (429 + Retry-After) rather than
+			// getting one more 401 -- otherwise the usual 401 challenge, unchanged.
+			failures.push(now);
+			directorAuthFailures.set(ip, failures);
+			if (failures.length >= DIRECTOR_AUTH_MAX_FAILURES) {
+				const retryAfterSeconds = Math.max(1, Math.ceil((failures[0] + DIRECTOR_AUTH_WINDOW_MS - now) / 1000));
+				res.setHeader("Retry-After", String(retryAfterSeconds));
+				return sendError(req, res, 429, "Too many attempts", "Too many failed authentication attempts — please wait and try again shortly.");
+			}
 			res.setHeader("WWW-Authenticate", 'Basic realm="Director"');
 			return sendError(req, res, 401, "Authentication required", "Provide the director credentials to obtain the director link.");
 		}
+
+		// Authenticated: reset this IP's failure counter BEFORE dispensing the
+		// link, so a legitimate director who mistyped a couple of times before
+		// getting it right isn't progressively penalized on their next visits.
+		directorAuthFailures.delete(ip);
 
 		// Non-secret params (the room name, and the non-sensitive &requireapproval
 		// flag) in the query string; secret params (password, roomkey) in the "#"
