@@ -158,7 +158,9 @@ function disableDirectorSSO() {
     sessionStorage.removeItem('vdo_pending_room_settings');
     sessionStorage.removeItem('vdo_pending_room_settings_recover');
     sessionStorage.setItem('vdo_sso_disabled_notice', '1');
-  } catch (e) {}
+  } catch (e) {
+    console.debug('disableDirectorSSO: sessionStorage update failed (storage unavailable?):', e);
+  }
 
   try {
     const authParams = ["auth", "requireauth", "authtoken", "universaltoken"];
@@ -178,12 +180,17 @@ function disableDirectorSSO() {
     }
     try {
       window.removeEventListener("beforeunload", confirmUnload);
-    } catch (e2) {}
+    } catch (e2) {
+      // removeEventListener does not throw in practice; guard is defensive before navigation.
+    }
     window.location.replace(url.toString());
   } catch (e) {
+    console.debug('disableDirectorSSO: URL rewrite failed, falling back to full reload:', e);
     try {
       window.removeEventListener("beforeunload", confirmUnload);
-    } catch (e2) {}
+    } catch (e2) {
+      // removeEventListener does not throw in practice; guard is defensive before reload.
+    }
     window.location.reload();
   }
 }
@@ -220,7 +227,9 @@ function ssoSignOut() {
   try {
     sessionStorage.removeItem('vdo_pending_room_settings');
     sessionStorage.removeItem('vdo_pending_room_settings_recover');
-  } catch (e) {}
+  } catch (e) {
+    console.debug('ssoSignOut: sessionStorage cleanup failed (storage unavailable?):', e);
+  }
   var passwordInput = document.getElementById('passwordRoom');
   if (passwordInput) {
     passwordInput.value = '';
