@@ -1,1 +1,1 @@
-export { CloudUploadCoordinator } from './cloud-storage.js';
+export { CloudUploadCoordinator } from "./cloud-storage.js";
