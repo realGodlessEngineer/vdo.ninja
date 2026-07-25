@@ -615,3 +615,46 @@ test("F22: per-IP isolation -- one client IP being throttled does not affect a d
 	const secondClient = await request(limitedApp).get("/config.js").set("X-Forwarded-For", "203.0.113.99");
 	assert.equal(secondClient.status, 200);
 });
+
+// ---------------------------------------------------------------------------
+// F-C — HSTS's includeSubDomains is opt-in, not default.
+// ---------------------------------------------------------------------------
+// Same hermetic pattern as loadThemedApp()/loadDirectorApp()/loadRateLimitedApp()
+// above: server.js reads HSTS_INCLUDE_SUBDOMAINS into its frozen `config` exactly
+// once at require time. The top-level `app` was required with it unset, so it
+// has includeSubDomains OFF -- reused directly by the "default" test below.
+// loadHstsApp() builds a fresh instance with the env var set hermetically:
+// snapshot the cached module, set/delete the env var, re-require server.js so
+// it re-reads it, then restore both the env and the original cached module so
+// the rest of the suite is untouched.
+function loadHstsApp(env) {
+	const serverPath = require.resolve("../server");
+	const originalModule = require.cache[serverPath];
+	const hadEnv = "HSTS_INCLUDE_SUBDOMAINS" in process.env;
+	const savedEnv = process.env.HSTS_INCLUDE_SUBDOMAINS;
+	if (env.HSTS_INCLUDE_SUBDOMAINS === undefined) delete process.env.HSTS_INCLUDE_SUBDOMAINS;
+	else process.env.HSTS_INCLUDE_SUBDOMAINS = env.HSTS_INCLUDE_SUBDOMAINS;
+
+	delete require.cache[serverPath];
+	const hstsApp = require("../server");
+
+	if (hadEnv) process.env.HSTS_INCLUDE_SUBDOMAINS = savedEnv;
+	else delete process.env.HSTS_INCLUDE_SUBDOMAINS;
+	require.cache[serverPath] = originalModule;
+
+	return hstsApp;
+}
+
+test("F-C: by default, Strict-Transport-Security omits includeSubDomains", async () => {
+	// The top-level `app` was required with HSTS_INCLUDE_SUBDOMAINS unset, so
+	// this proves the safe-by-default behavior forkers get with no configuration.
+	const res = await request(app).get("/healthz");
+	assert.equal(res.headers["strict-transport-security"], "max-age=15552000");
+	assert.doesNotMatch(res.headers["strict-transport-security"], /includeSubDomains/);
+});
+
+test("F-C: HSTS_INCLUDE_SUBDOMAINS=true appends includeSubDomains to the Strict-Transport-Security header", async () => {
+	const hstsApp = loadHstsApp({ HSTS_INCLUDE_SUBDOMAINS: "true" });
+	const res = await request(hstsApp).get("/healthz");
+	assert.equal(res.headers["strict-transport-security"], "max-age=15552000; includeSubDomains");
+});

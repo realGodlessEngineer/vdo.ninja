@@ -73,6 +73,10 @@ const config = {
 	brandVersion: process.env.BRAND_VERSION || null,
 	theme: process.env.THEME || null,
 	logRequests: process.env.LOG_REQUESTS === "true",
+	// F-C: HSTS's includeSubDomains is off by default -- see the header comment
+	// further below for why -- and only re-enabled when an operator who owns the
+	// whole DNS zone opts in with HSTS_INCLUDE_SUBDOMAINS=true.
+	hstsIncludeSubDomains: process.env.HSTS_INCLUDE_SUBDOMAINS === "true",
 	// F18 (server-gated director link). DIRECTOR_SECRET/DIRECTOR_ROOM gate the
 	// feature and are trimmed because trailing whitespace in an env var is
 	// almost always an accident and would silently change the auth password /
@@ -157,7 +161,12 @@ app.use((req, res, next) => {
 	res.setHeader("Access-Control-Allow-Origin", "*");
 	res.setHeader("X-Content-Type-Options", "nosniff");
 	res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
-	res.setHeader("Strict-Transport-Security", "max-age=15552000; includeSubDomains");
+	// includeSubDomains is opt-in (HSTS_INCLUDE_SUBDOMAINS=true), not default: it forces
+	// HTTPS+HSTS onto every sibling subdomain of the serving host for 180 days, browser-
+	// cached and hard to undo. A forker deploying on e.g. app.example.com but not
+	// controlling the rest of example.com would silently break sibling subdomains still on
+	// HTTP. Only set the env var if you own the entire DNS zone.
+	res.setHeader("Strict-Transport-Security", config.hstsIncludeSubDomains ? "max-age=15552000; includeSubDomains" : "max-age=15552000");
 	next();
 });
 
