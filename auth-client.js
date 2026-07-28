@@ -12,6 +12,42 @@ session.authImplicitRoomSecret = null;
 session.authStreamMapping = {};
 session.handleToStream = {};
 
+// Shared fetch helper for the auth service API. Centralizes Authorization/Content-Type
+// header construction and JSON body serialization; returns the raw Response so each
+// call site keeps its own status/json handling unchanged.
+//
+// options:
+//   method             - HTTP method, defaults to "GET"
+//   body               - plain object to JSON.stringify() as the request body; when provided,
+//                         Content-Type: application/json is added automatically
+//   token              - value to send as `Authorization: Bearer <token>`; when omitted entirely,
+//                         no Authorization header is sent at all
+//   omitAuthIfMissing  - when true, the Authorization header is left off entirely if token is
+//                         falsy (instead of the default of sending an empty-string value)
+//   headers            - additional headers to merge in
+async function authApi(path, options = {}) {
+	const { method = "GET", body, token, omitAuthIfMissing = false, headers = {} } = options;
+	const finalHeaders = Object.assign({}, headers);
+
+	if (token !== undefined) {
+		if (omitAuthIfMissing) {
+			if (token) {
+				finalHeaders["Authorization"] = `Bearer ${token}`;
+			}
+		} else {
+			finalHeaders["Authorization"] = token ? `Bearer ${token}` : "";
+		}
+	}
+
+	const init = { method: method, headers: finalHeaders };
+	if (body !== undefined) {
+		finalHeaders["Content-Type"] = "application/json";
+		init.body = JSON.stringify(body);
+	}
+
+	return fetch(`${AUTH_SERVICE_URL}${path}`, init);
+}
+
 // Initialize authentication
 async function initAuthentication() {
 	// Check URL parameters for universal token first
@@ -92,31 +128,82 @@ function showAuthUI(options = {}) {
 	authContainer.id = "auth-container";
 	const isDirectorAuthURL = session.director || urlParams.has("director") || urlParams.has("dir");
 	const canDisableSSO = isDirectorAuthURL && session.authMode && !session.universalToken && !session.decrypted && !options.hideDisableSSO;
-	authContainer.innerHTML = `
-    <div class="auth-modal">
-      <h2>Sign in to VDO.Ninja</h2>
-      <p>${options.message || "Sign in to claim your personal stream ID and enable advanced features"}</p>
-      
-      <div class="auth-buttons">
-        <button onclick="socialSignIn('google')" class="auth-button google">
-          <img src="./media/google.png" alt="Google">
-          Sign in with Google
-        </button>
-        <button onclick="socialSignIn('discord')" class="auth-button discord">
-          <img src="./media/discord.png" alt="Discord">
-          Sign in with Discord
-        </button>
-        <button onclick="socialSignIn('twitch')" class="auth-button twitch">
-          <img src="./media/twitch.png" alt="Twitch">
-          Sign in with Twitch
-        </button>
-      </div>
-      
-      ${!session.requireAuth && !options.requireAuth ? '<button onclick="skipAuth()" class="skip-auth">Continue without signing in</button>' : ""}
-      ${canDisableSSO ? '<div style="display:flex; align-items:center; gap:0.75rem; margin:1rem 0 0.25rem 0; color:var(--text-color-secondary, #aaa); font-size:0.8rem;"><span style="flex:1; border-top:1px solid var(--border-color, #444);"></span><span>or</span><span style="flex:1; border-top:1px solid var(--border-color, #444);"></span></div><button onclick="disableDirectorSSO()" class="skip-auth" style="margin-top:0.5rem;">Enter room without SSO</button><p style="font-size:0.78rem; line-height:1.35; opacity:0.85; margin:0.5rem 0 0 0;">Disables SSO for this director room. New guest links will not include SSO; older SSO guest invites may not join this room.</p>' : ""}
-    </div>
-  `;
 
+	const modal = document.createElement("div");
+	modal.className = "auth-modal";
+
+	const heading = document.createElement("h2");
+	heading.textContent = "Sign in to VDO.Ninja";
+
+	const message = document.createElement("p");
+	message.textContent = options.message || "Sign in to claim your personal stream ID and enable advanced features";
+
+	const buttons = document.createElement("div");
+	buttons.className = "auth-buttons";
+
+	[
+		{ provider: "google", label: "Sign in with Google", icon: "./media/google.png", alt: "Google" },
+		{ provider: "discord", label: "Sign in with Discord", icon: "./media/discord.png", alt: "Discord" },
+		{ provider: "twitch", label: "Sign in with Twitch", icon: "./media/twitch.png", alt: "Twitch" }
+	].forEach(({ provider, label, icon, alt }) => {
+		const button = document.createElement("button");
+		button.className = `auth-button ${provider}`;
+		button.onclick = () => socialSignIn(provider);
+
+		const img = document.createElement("img");
+		img.src = icon;
+		img.alt = alt;
+
+		button.appendChild(img);
+		button.appendChild(document.createTextNode(label));
+		buttons.appendChild(button);
+	});
+
+	modal.appendChild(heading);
+	modal.appendChild(message);
+	modal.appendChild(buttons);
+
+	if (!session.requireAuth && !options.requireAuth) {
+		const skipButton = document.createElement("button");
+		skipButton.className = "skip-auth";
+		skipButton.onclick = () => skipAuth();
+		skipButton.textContent = "Continue without signing in";
+		modal.appendChild(skipButton);
+	}
+
+	if (canDisableSSO) {
+		const divider = document.createElement("div");
+		divider.style.cssText = "display:flex; align-items:center; gap:0.75rem; margin:1rem 0 0.25rem 0; color:var(--text-color-secondary, #aaa); font-size:0.8rem;";
+
+		const leftRule = document.createElement("span");
+		leftRule.style.cssText = "flex:1; border-top:1px solid var(--border-color, #444);";
+
+		const orLabel = document.createElement("span");
+		orLabel.textContent = "or";
+
+		const rightRule = document.createElement("span");
+		rightRule.style.cssText = "flex:1; border-top:1px solid var(--border-color, #444);";
+
+		divider.appendChild(leftRule);
+		divider.appendChild(orLabel);
+		divider.appendChild(rightRule);
+
+		const disableButton = document.createElement("button");
+		disableButton.className = "skip-auth";
+		disableButton.style.cssText = "margin-top:0.5rem;";
+		disableButton.onclick = () => disableDirectorSSO();
+		disableButton.textContent = "Enter room without SSO";
+
+		const disclaimer = document.createElement("p");
+		disclaimer.style.cssText = "font-size:0.78rem; line-height:1.35; opacity:0.85; margin:0.5rem 0 0 0;";
+		disclaimer.textContent = "Disables SSO for this director room. New guest links will not include SSO; older SSO guest invites may not join this room.";
+
+		modal.appendChild(divider);
+		modal.appendChild(disableButton);
+		modal.appendChild(disclaimer);
+	}
+
+	authContainer.appendChild(modal);
 	document.body.appendChild(authContainer);
 }
 
@@ -249,9 +336,7 @@ async function populateUserInfo() {
 	if (!session.authToken) return;
 
 	try {
-		const response = await fetch(`${AUTH_SERVICE_URL}/api/user/info`, {
-			headers: { Authorization: `Bearer ${session.authToken}` }
-		});
+		const response = await authApi("/api/user/info", { token: session.authToken });
 
 		if (response.ok) {
 			const userInfo = await response.json();
@@ -331,17 +416,14 @@ async function assignAuthStream() {
 	if (!session.authToken || session.authStreamAssigned) return;
 
 	try {
-		const response = await fetch(`${AUTH_SERVICE_URL}/api/stream/assign`, {
+		const response = await authApi("/api/stream/assign", {
 			method: "POST",
-			headers: {
-				Authorization: `Bearer ${session.authToken}`,
-				"Content-Type": "application/json"
-			},
-			body: JSON.stringify({
+			token: session.authToken,
+			body: {
 				roomId: session.roomid || "lobby",
 				deviceLabel: session.streamID || "camera",
 				useEncryption: false // Disabled for now until fully tested
-			})
+			}
 		});
 
 		if (response.ok) {
@@ -393,16 +475,13 @@ async function validateStreamAuth(streamId, authData) {
 	if (!session.authToken || !authData) return true;
 
 	try {
-		const response = await fetch(`${AUTH_SERVICE_URL}/api/stream/verify`, {
+		const response = await authApi("/api/stream/verify", {
 			method: "POST",
-			headers: {
-				Authorization: `Bearer ${session.authToken}`,
-				"Content-Type": "application/json"
-			},
-			body: JSON.stringify({
+			token: session.authToken,
+			body: {
 				streamId: streamId,
 				auth: authData
-			})
+			}
 		});
 
 		if (response.ok) {
@@ -435,9 +514,7 @@ async function resolveViewHandles(viewList) {
 		if (target.startsWith("@")) {
 			// User handle - resolve to current stream
 			try {
-				const response = await fetch(`${AUTH_SERVICE_URL}/api/stream/user/${target}`, {
-					headers: { Authorization: `Bearer ${session.authToken}` }
-				});
+				const response = await authApi(`/api/stream/user/${target}`, { token: session.authToken });
 
 				if (response.ok) {
 					const data = await response.json();
@@ -461,17 +538,14 @@ async function resolveViewHandles(viewList) {
 // Check room access
 async function checkRoomAccess(roomIdOrAlias, isDirector = false) {
 	console.log("Checking room access for:", roomIdOrAlias, "with universal token:", session.universalToken);
-	const response = await fetch(`${AUTH_SERVICE_URL}/api/room/access`, {
+	const response = await authApi("/api/room/access", {
 		method: "POST",
-		headers: {
-			Authorization: session.authToken ? `Bearer ${session.authToken}` : "",
-			"Content-Type": "application/json"
-		},
-		body: JSON.stringify({
+		token: session.authToken,
+		body: {
 			room: roomIdOrAlias,
 			isDirector: isDirector,
 			universalToken: session.universalToken || null
-		})
+		}
 	});
 
 	const data = await response.json();
@@ -520,15 +594,12 @@ async function joinRoomWithAuth(roomIdOrAlias) {
 	// If we have a universal token, validate it first
 	if (session.universalToken) {
 		try {
-			const response = await fetch(`${AUTH_SERVICE_URL}/api/room/validate-universal`, {
+			const response = await authApi("/api/room/validate-universal", {
 				method: "POST",
-				headers: {
-					"Content-Type": "application/json"
-				},
-				body: JSON.stringify({
+				body: {
 					token: session.universalToken,
 					roomId: roomIdOrAlias
-				})
+				}
 			});
 
 			if (response.ok) {
@@ -538,10 +609,9 @@ async function joinRoomWithAuth(roomIdOrAlias) {
 					session.roomid = roomIdOrAlias;
 					// Still need the room secret for handshake-level access
 					try {
-						const secretResp = await fetch(`${AUTH_SERVICE_URL}/api/room/secret/${roomIdOrAlias}`, {
+						const secretResp = await authApi(`/api/room/secret/${roomIdOrAlias}`, {
 							method: "POST",
-							headers: { "Content-Type": "application/json" },
-							body: JSON.stringify({ universalToken: session.universalToken })
+							body: { universalToken: session.universalToken }
 						});
 						if (!secretResp.ok) {
 							console.error("Failed to fetch room secret:", secretResp.status);
@@ -615,14 +685,11 @@ async function joinRoomWithAuth(roomIdOrAlias) {
 	// Fetch room secret to enforce SSO access at the handshake level
 	let roomSecretApplied = false;
 	try {
-		const headers = { "Content-Type": "application/json" };
-		if (session.authToken) {
-			headers["Authorization"] = `Bearer ${session.authToken}`;
-		}
-		const secretResp = await fetch(`${AUTH_SERVICE_URL}/api/room/secret/${roomIdOrAlias}`, {
+		const secretResp = await authApi(`/api/room/secret/${roomIdOrAlias}`, {
 			method: "POST",
-			headers: headers,
-			body: JSON.stringify({ universalToken: session.universalToken || null })
+			token: session.authToken,
+			omitAuthIfMissing: true,
+			body: { universalToken: session.universalToken || null }
 		});
 		if (!secretResp.ok) {
 			console.error("Failed to fetch room secret:", secretResp.status);
@@ -688,11 +755,9 @@ async function requestRoomAccess(roomId) {
 	}
 
 	try {
-		const response = await fetch(`${AUTH_SERVICE_URL}/api/room/request-access/${roomId}`, {
+		const response = await authApi(`/api/room/request-access/${roomId}`, {
 			method: "POST",
-			headers: {
-				Authorization: `Bearer ${session.authToken}`
-			}
+			token: session.authToken
 		});
 
 		if (response.ok) {
@@ -713,11 +778,22 @@ function updateStreamDisplay(streamId, userInfo) {
 		if (header && !header.querySelector(".user-auth-badge")) {
 			const badge = document.createElement("div");
 			badge.className = "user-auth-badge";
-			badge.innerHTML = `
-        <img src="${userInfo.avatar}" alt="${userInfo.displayName}">
-        <span class="user-handle">${userInfo.userHandle}</span>
-        <span class="user-provider ${userInfo.provider}">${userInfo.provider}</span>
-      `;
+
+			const img = document.createElement("img");
+			img.src = userInfo.avatar;
+			img.alt = userInfo.displayName;
+
+			const handleSpan = document.createElement("span");
+			handleSpan.className = "user-handle";
+			handleSpan.textContent = userInfo.userHandle;
+
+			const providerSpan = document.createElement("span");
+			providerSpan.className = `user-provider ${userInfo.provider}`;
+			providerSpan.textContent = userInfo.provider;
+
+			badge.appendChild(img);
+			badge.appendChild(handleSpan);
+			badge.appendChild(providerSpan);
 			header.appendChild(badge);
 		}
 	}
@@ -759,22 +835,15 @@ async function resolveStream(streamId) {
 	}
 
 	try {
-		const headers = {
-			"Content-Type": "application/json"
-		};
-
-		if (session.authToken) {
-			headers["Authorization"] = `Bearer ${session.authToken}`;
-		}
-
-		const response = await fetch(`${AUTH_SERVICE_URL}/api/stream/resolve`, {
+		const response = await authApi("/api/stream/resolve", {
 			method: "POST",
-			headers: headers,
-			body: JSON.stringify({
+			token: session.authToken,
+			omitAuthIfMissing: true,
+			body: {
 				streamId: streamId,
 				roomId: session.roomid,
 				universalToken: session.universalToken
-			})
+			}
 		});
 
 		if (response.ok) {
@@ -798,16 +867,13 @@ async function getStreamKey(streamId) {
 	if (!session.authToken) return null;
 
 	try {
-		const response = await fetch(`${AUTH_SERVICE_URL}/api/stream/key`, {
+		const response = await authApi("/api/stream/key", {
 			method: "POST",
-			headers: {
-				Authorization: `Bearer ${session.authToken}`,
-				"Content-Type": "application/json"
-			},
-			body: JSON.stringify({
+			token: session.authToken,
+			body: {
 				streamId: streamId,
 				roomId: session.roomid
-			})
+			}
 		});
 
 		if (response.ok) {
@@ -847,16 +913,13 @@ function startAuthHeartbeat() {
 	setInterval(async () => {
 		if (session.authToken && session.streamID && session.authStreamAssigned) {
 			try {
-				await fetch(`${AUTH_SERVICE_URL}/api/stream/heartbeat`, {
+				await authApi("/api/stream/heartbeat", {
 					method: "POST",
-					headers: {
-						Authorization: `Bearer ${session.authToken}`,
-						"Content-Type": "application/json"
-					},
-					body: JSON.stringify({
+					token: session.authToken,
+					body: {
 						streamId: session.streamID,
 						roomId: session.roomid || "lobby"
-					})
+					}
 				});
 			} catch (e) {
 				console.error("Heartbeat failed:", e);
@@ -874,16 +937,13 @@ async function createUniversalToken() {
 
 	try {
 		console.log("Creating universal token for room:", session.roomid);
-		const response = await fetch(`${AUTH_SERVICE_URL}/api/room/universal-token`, {
+		const response = await authApi("/api/room/universal-token", {
 			method: "POST",
-			headers: {
-				Authorization: `Bearer ${session.authToken}`,
-				"Content-Type": "application/json"
-			},
-			body: JSON.stringify({
+			token: session.authToken,
+			body: {
 				roomId: session.roomid,
 				description: "View/Scene access token"
-			})
+			}
 		});
 
 		if (response.ok) {
@@ -940,13 +1000,10 @@ async function updateRoomSettings(roomId, settings) {
 	}
 
 	try {
-		const response = await fetch(`${AUTH_SERVICE_URL}/api/room/settings/${roomId}`, {
+		const response = await authApi(`/api/room/settings/${roomId}`, {
 			method: "PUT",
-			headers: {
-				Authorization: `Bearer ${session.authToken}`,
-				"Content-Type": "application/json"
-			},
-			body: JSON.stringify(settings)
+			token: session.authToken,
+			body: settings
 		});
 
 		if (response.ok) {
@@ -971,11 +1028,7 @@ async function getRoomAccessRequests(roomId) {
 	}
 
 	try {
-		const response = await fetch(`${AUTH_SERVICE_URL}/api/room/requests/${roomId}`, {
-			headers: {
-				Authorization: `Bearer ${session.authToken}`
-			}
-		});
+		const response = await authApi(`/api/room/requests/${roomId}`, { token: session.authToken });
 
 		if (response.ok) {
 			return await response.json();
@@ -995,11 +1048,9 @@ async function handleAccessRequest(roomId, userId, action) {
 	}
 
 	try {
-		const response = await fetch(`${AUTH_SERVICE_URL}/api/room/request/${roomId}/${userId}/${action}`, {
+		const response = await authApi(`/api/room/request/${roomId}/${userId}/${action}`, {
 			method: "POST",
-			headers: {
-				Authorization: `Bearer ${session.authToken}`
-			}
+			token: session.authToken
 		});
 
 		return response.ok;
