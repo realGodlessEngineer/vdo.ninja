@@ -48,6 +48,16 @@ app.disable("x-powered-by");
 // boot with an error that names TRUST_PROXY and the value it rejected.
 const rawTrustProxy = (process.env.TRUST_PROXY ?? "").trim();
 
+// T4/F-D: hard ceiling on the two per-IP Maps further below (F22's
+// rateLimitBuckets and F-A's directorAuthFailures) -- see config.rateLimitMaxIps
+// below. Parsed here, ahead of `> 0`, rather than the bare `|| 50000` idiom
+// rateLimitRpm uses: unlike rateLimitRpm (whose negative values are harmless --
+// RATE_LIMIT_ENABLED already normalizes them to "off" before anything reads the
+// field), a non-positive ceiling would reach the eviction logic directly and
+// collapse each Map down to holding a single entry, defeating both limiters --
+// so zero/negative/non-numeric all fall back to the default identically.
+const parsedRateLimitMaxIps = Number.parseInt(process.env.RATE_LIMIT_MAX_IPS, 10);
+
 // ---------------------------------------------------------------------------
 // Centralized, validated server configuration (F7). Every environment-driven
 // knob is read from process.env exactly once, here -- add new settings to
@@ -97,7 +107,14 @@ const config = {
 	// below (the thing the middleware registration actually gates on) treats
 	// zero, negative, unset, and non-numeric identically via `> 0`, so this
 	// field is only ever consulted once already known to be a positive count.
-	rateLimitRpm: Number.parseInt(process.env.RATE_LIMIT_RPM, 10) || 0
+	rateLimitRpm: Number.parseInt(process.env.RATE_LIMIT_RPM, 10) || 0,
+	// T4/F-D. Read unconditionally (not gated on RATE_LIMIT_ENABLED) because the
+	// director map below lives under `if (DIRECTOR_ENABLED)` and must be able to
+	// read this same ceiling even when the global rate limiter feature is off --
+	// both Maps share one value so they stay consistent with each other. See
+	// parsedRateLimitMaxIps above for why zero/negative is rejected rather than
+	// just falling through the usual `|| 50000`.
+	rateLimitMaxIps: parsedRateLimitMaxIps > 0 ? parsedRateLimitMaxIps : 50000
 };
 
 try {
@@ -183,6 +200,37 @@ if (config.logRequests) {
 	});
 }
 
+// T4/F-D: shared bounded-touch helper for the two per-IP Maps in this file --
+// F22's rateLimitBuckets right below, and F-A's directorAuthFailures further
+// down in the /director handler. Both are otherwise bounded only by their own
+// periodic sweep (see each Map's sweepInterval), so between sweeps a
+// misconfigured TRUST_PROXY plus a spoofed X-Forwarded-For could otherwise
+// mint one fresh bucket per request and grow either Map without bound. This
+// caps both at config.rateLimitMaxIps, evicting the least-recently-active
+// entry rather than the first-ever-inserted one: `map.delete(ip)` followed by
+// `map.set(ip, value)` moves `ip` to the Map's MRU/end position even when it
+// already existed, because `Map#set` on an EXISTING key updates the value in
+// place WITHOUT reordering it -- so without that delete-then-set, an IP that
+// merely connected early would stay stuck at the front and be evicted first
+// even while it's the one actively hitting the server right now. With it, the
+// front of the Map is always the genuine LRU entry, so under a spoofed-XFF
+// flood the evicted entry is always a stale one-off attacker bucket, never
+// the hot legitimate client.
+//
+// Eviction only fires for a genuinely NEW ip when the Map is already full: if
+// `ip` was already present, the leading delete drops the size by one first,
+// so the `>= maxSize` check below is false and nothing is evicted -- an
+// existing entry is refreshed, never spuriously evicted, even sitting exactly
+// at the cap. Net size after every call is therefore always <= maxSize.
+function touchBounded(map, ip, value, maxSize) {
+	map.delete(ip);
+	if (map.size >= maxSize) {
+		const oldest = map.keys().next().value; // insertion-order front == LRU
+		if (oldest !== undefined) map.delete(oldest);
+	}
+	map.set(ip, value);
+}
+
 // ---------------------------------------------------------------------------
 // F22: opt-in, in-memory, per-IP request-rate limiter.
 // ---------------------------------------------------------------------------
@@ -263,14 +311,19 @@ if (RATE_LIMIT_ENABLED) {
 		const timestamps = (rateLimitBuckets.get(ip) || []).filter(t => t > cutoff);
 
 		if (timestamps.length >= config.rateLimitRpm) {
-			rateLimitBuckets.set(ip, timestamps); // keep the pruned array even when rejecting
+			// Already at the cap for this ip, so this can't be a new Map entry --
+			// refresh its recency anyway (T4) so an actively-throttled ip stays MRU
+			// and isn't the one evicted while it backs off.
+			touchBounded(rateLimitBuckets, ip, timestamps, config.rateLimitMaxIps); // keep the pruned array even when rejecting
 			const retryAfterSeconds = Math.max(1, Math.ceil((timestamps[0] + RATE_LIMIT_WINDOW_MS - now) / 1000));
 			res.setHeader("Retry-After", String(retryAfterSeconds));
 			return sendError(req, res, 429, "Too many requests", "You’ve made too many requests recently — please slow down and try again shortly.");
 		}
 
 		timestamps.push(now);
-		rateLimitBuckets.set(ip, timestamps);
+		// T4: bounded touch -- may be a brand-new ip, so this is the path that can
+		// evict the current LRU entry once rateLimitBuckets is at config.rateLimitMaxIps.
+		touchBounded(rateLimitBuckets, ip, timestamps, config.rateLimitMaxIps);
 		next();
 	});
 }
@@ -429,9 +482,9 @@ if (DIRECTOR_ENABLED) {
 
 	// ip -> ascending-order timestamps (ms since epoch) of FAILED auth attempts
 	// within the trailing window. A plain Map, kept bounded by the sweep below,
-	// exactly like F22's rateLimitBuckets. (A hard ceiling on this Map's size is
-	// deliberately out of scope here -- it's tracked as T4 and will be applied
-	// consistently across this map and F22's limiter.)
+	// exactly like F22's rateLimitBuckets -- and, per T4, by the same
+	// touchBounded() hard ceiling (config.rateLimitMaxIps) at every .set() site
+	// below, so this map and F22's limiter are capped consistently.
 	const directorAuthFailures = new Map();
 
 	// Same proactive sweep as F22's rate limiter: on the window cadence, delete
@@ -465,7 +518,10 @@ if (DIRECTOR_ENABLED) {
 		// user recovers within DIRECTOR_AUTH_WINDOW_MS -- the same recovery
 		// property F22 documents). Retry-After via F22's exact formula.
 		if (failures.length >= DIRECTOR_AUTH_MAX_FAILURES) {
-			directorAuthFailures.set(ip, failures); // keep the pruned array even when rejecting
+			// Already at the cap for this ip, so this can't be a new Map entry --
+			// refresh its recency anyway (T4) so an actively-throttled ip stays MRU
+			// and isn't the one evicted while it's locked out.
+			touchBounded(directorAuthFailures, ip, failures, config.rateLimitMaxIps); // keep the pruned array even when rejecting
 			const retryAfterSeconds = Math.max(1, Math.ceil((failures[0] + DIRECTOR_AUTH_WINDOW_MS - now) / 1000));
 			res.setHeader("Retry-After", String(retryAfterSeconds));
 			return sendError(req, res, 429, "Too many attempts", "Too many failed authentication attempts — please wait and try again shortly.");
@@ -495,7 +551,10 @@ if (DIRECTOR_ENABLED) {
 			// the threshold is itself throttled (429 + Retry-After) rather than
 			// getting one more 401 -- otherwise the usual 401 challenge, unchanged.
 			failures.push(now);
-			directorAuthFailures.set(ip, failures);
+			// T4: bounded touch -- may be a brand-new ip, so this is the path that
+			// can evict the current LRU entry once directorAuthFailures is at
+			// config.rateLimitMaxIps.
+			touchBounded(directorAuthFailures, ip, failures, config.rateLimitMaxIps);
 			if (failures.length >= DIRECTOR_AUTH_MAX_FAILURES) {
 				const retryAfterSeconds = Math.max(1, Math.ceil((failures[0] + DIRECTOR_AUTH_WINDOW_MS - now) / 1000));
 				res.setHeader("Retry-After", String(retryAfterSeconds));

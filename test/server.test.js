@@ -517,7 +517,7 @@ test("F-A/T1: a correct password resets the counter -- earlier failures don't ca
 // module, set/delete the requested env vars, re-require server.js so it
 // re-reads them, then restore both the env and the original cached module so
 // the rest of the suite is untouched.
-const RATE_LIMIT_ENV_KEYS = ["RATE_LIMIT_RPM", "TRUST_PROXY"];
+const RATE_LIMIT_ENV_KEYS = ["RATE_LIMIT_RPM", "TRUST_PROXY", "RATE_LIMIT_MAX_IPS"];
 
 function loadRateLimitedApp(env) {
 	const serverPath = require.resolve("../server");
@@ -614,6 +614,85 @@ test("F22: per-IP isolation -- one client IP being throttled does not affect a d
 	// A second, distinct client IP has its own untouched bucket.
 	const secondClient = await request(limitedApp).get("/config.js").set("X-Forwarded-For", "203.0.113.99");
 	assert.equal(secondClient.status, 200);
+});
+
+// T4/F-D: rateLimitBuckets is bounded not just by its periodic sweep but also by
+// a hard ceiling (RATE_LIMIT_MAX_IPS), least-recently-active entry evicted first.
+// Without it, a misconfigured TRUST_PROXY plus a spoofed X-Forwarded-For could
+// mint one fresh bucket per request and grow the Map without bound between
+// sweeps. RATE_LIMIT_MAX_IPS: "3" makes the ceiling cheap to actually drive here.
+test("F22/T4: rateLimitBuckets is hard-capped by RATE_LIMIT_MAX_IPS, evicting the least-recently-active IP first", async () => {
+	const limitedApp = loadRateLimitedApp({ RATE_LIMIT_RPM: "1", RATE_LIMIT_MAX_IPS: "3", TRUST_PROXY: "1" });
+	const clientA = "203.0.113.201";
+
+	// Client A's bucket is created (200) then immediately full for its 1rpm
+	// allowance (429) -- it now sits in the Map, untouched from here on.
+	const first = await request(limitedApp).get("/config.js").set("X-Forwarded-For", clientA);
+	assert.equal(first.status, 200);
+	const throttled = await request(limitedApp).get("/config.js").set("X-Forwarded-For", clientA);
+	assert.equal(throttled.status, 429);
+
+	// Three more, never-before-seen IPs each mint a brand-new bucket: the Map is
+	// [A] (size 1) going in, the 1st grows it to size 2, the 2nd to size 3 (at the
+	// cap), and the 3rd is the one that must evict to stay <= 3. A hasn't been
+	// touched since its 429 above, so A -- not the 1st or 2nd new IP -- is the
+	// least-recently-active entry and the one evicted.
+	for (let i = 0; i < 3; i++) {
+		const res = await request(limitedApp)
+			.get("/config.js")
+			.set("X-Forwarded-For", `203.0.113.${210 + i}`);
+		assert.equal(res.status, 200);
+	}
+
+	// A's bucket was evicted to make room, so this request starts a brand-new,
+	// empty bucket for A and is allowed. If the Map were unbounded, A's original
+	// (already-full) bucket would still be sitting there and this would still be
+	// 429 -- so seeing 200 here is exactly what proves the hard cap fired and
+	// evicted the right (least-recently-active) entry.
+	const afterEviction = await request(limitedApp).get("/config.js").set("X-Forwarded-For", clientA);
+	assert.equal(afterEviction.status, 200);
+});
+
+// T4/F-D: isolates LRU eviction from a plain FIFO (evict-first-inserted) policy.
+// In the test above, IP A is simultaneously the first-inserted AND the
+// least-recently-active entry, so evicting A is consistent with either policy --
+// it can't tell them apart. Here, A is re-touched after B and C so it is no
+// longer the least-recently-active entry despite still being the first-ever
+// inserted, which only LRU (not FIFO) tracks correctly.
+test("F22/T4: recency refresh on the 429 path is what picks the eviction victim, not insertion order", async () => {
+	const limitedApp = loadRateLimitedApp({ RATE_LIMIT_RPM: "1", RATE_LIMIT_MAX_IPS: "3", TRUST_PROXY: "1" });
+	const [clientA, clientB, clientC, clientD] = ["203.0.113.220", "203.0.113.221", "203.0.113.222", "203.0.113.223"];
+
+	// Fill the cap with three distinct IPs, one request each (all 200). Map
+	// (insertion/MRU order, front = LRU) is now [A, B, C].
+	for (const ip of [clientA, clientB, clientC]) {
+		const res = await request(limitedApp).get("/config.js").set("X-Forwarded-For", ip);
+		assert.equal(res.status, 200);
+	}
+
+	// Re-touch A: at RPM=1, A's bucket is already full, so this is a 429 -- but
+	// the 429 path calls touchBounded too, which moves A to the MRU/end position.
+	// Map is now [B, C, A]: B, not A, is the new least-recently-active entry,
+	// even though A was inserted first.
+	const retouchA = await request(limitedApp).get("/config.js").set("X-Forwarded-For", clientA);
+	assert.equal(retouchA.status, 429);
+
+	// A fourth, never-before-seen IP forces exactly one eviction to stay <= 3.
+	// Under correct LRU the front is B, so B is evicted: map becomes [C, A, D].
+	// Under a broken FIFO (evict first-inserted) A would be evicted instead.
+	const insertD = await request(limitedApp).get("/config.js").set("X-Forwarded-For", clientD);
+	assert.equal(insertD.status, 200);
+
+	// Discriminator: B was evicted, so it starts a fresh, empty bucket -- 200.
+	const freshB = await request(limitedApp).get("/config.js").set("X-Forwarded-For", clientB);
+	assert.equal(freshB.status, 200);
+
+	// Discriminator (load-bearing): A survived the eviction, so its original,
+	// still-full 1rpm bucket is still there -- 429. Under a FIFO eviction policy
+	// A would have been evicted here and returned 200; a 429 proves the recency
+	// refresh (LRU) is what chose the victim.
+	const stillA = await request(limitedApp).get("/config.js").set("X-Forwarded-For", clientA);
+	assert.equal(stillA.status, 429);
 });
 
 // ---------------------------------------------------------------------------
