@@ -4,15 +4,12 @@ import { readDiskRecordingState, isDiskRecordingEnabled, setDiskRecordingEnabled
 import { readCloudLinkStatus, isCloudLinkFresh, markCloudLinked, markCloudUnlinked } from "./cloud-link-store.js?v=1";
 import { readCaptureMode, writeCaptureMode } from "./capture-mode-store.js?v=1";
 import { readPreflightState, writePreflightState, isPreflightFresh } from "./preflight-store.js?v=1";
+import { readIcecastSettings, writeIcecastSettings, resolveIcecastRelayUrl, resolveIcecastRelayToken, DEFAULT_ICECAST_MIME_TYPE } from "./icecast-settings-store.js?v=1";
 
 const STUDIO_ROOT_ID = "podcast-root";
 const ROSTER_REFRESH_MS = 1500;
 const PREFLIGHT_MIN_MANDATORY_MS = 5 * 60 * 1000;
 const DROPBOX_GUIDE_URL = "/cloud.html#dropbox";
-const ICECAST_SETTINGS_STORAGE_KEY = "podcastStudio.icecastSettings";
-const ICECAST_SETTINGS_VERSION = 2;
-const DEFAULT_ICECAST_MIME_TYPE = ICECAST_MIME_OPTIONS[0].value;
-const DEFAULT_ICECAST_RELAY_URL = "https://vdo-ninja-icecast-relay.vdo.workers.dev/publish";
 const PODCAST_CLOUD_EVENT = "podcast-cloud-status";
 const PODCAST_DISK_EVENT = "podcast-disk-state";
 const PODCAST_RECORD_PLAN_EVENT = "podcast-record-plan";
@@ -495,68 +492,6 @@ function snapshotHighResClock() {
 		timeOrigin: origin,
 		wallClockMs: Math.round(origin + now)
 	};
-}
-
-function readIcecastSettings() {
-	try {
-		const raw = window.localStorage.getItem(ICECAST_SETTINGS_STORAGE_KEY);
-		if (!raw) {
-			return {};
-		}
-		const parsed = JSON.parse(raw);
-		if (!parsed || typeof parsed !== "object") {
-			return {};
-		}
-		const settings = { ...parsed };
-		const version = Number(settings.version || 0);
-		if (version < ICECAST_SETTINGS_VERSION && (!settings.mimeType || settings.mimeType === "audio/webm;codecs=opus" || settings.mimeType === "audio/webm")) {
-			settings.mimeType = DEFAULT_ICECAST_MIME_TYPE;
-		}
-		settings.version = ICECAST_SETTINGS_VERSION;
-		return settings;
-	} catch (error) {
-		console.warn("Unable to read Icecast settings", error);
-		return {};
-	}
-}
-
-function writeIcecastSettings(settings) {
-	const safeSettings = { ...(settings || {}) };
-	delete safeSettings.relayUrl;
-	delete safeSettings.relayToken;
-	safeSettings.version = ICECAST_SETTINGS_VERSION;
-	try {
-		window.localStorage.setItem(ICECAST_SETTINGS_STORAGE_KEY, JSON.stringify(safeSettings));
-	} catch (error) {
-		console.warn("Unable to store Icecast settings", error);
-	}
-}
-
-function readUrlParam(name) {
-	try {
-		if (typeof urlParams !== "undefined" && urlParams && typeof urlParams.get === "function") {
-			return urlParams.get(name) || "";
-		}
-	} catch (error) {
-		console.warn("Unable to read URL params", error);
-	}
-	try {
-		const params = new URLSearchParams(window.location.search);
-		return params.get(name) || "";
-	} catch (error) {
-		console.warn("Unable to parse URL params", error);
-	}
-	return "";
-}
-
-function resolveIcecastRelayUrl(settings = {}) {
-	const configured = (typeof window !== "undefined" && typeof window.VDO_NINJA_ICECAST_RELAY_URL === "string" ? window.VDO_NINJA_ICECAST_RELAY_URL : "") || readUrlParam("icecastrelay") || readUrlParam("icecastrelayurl") || settings.relayUrl || DEFAULT_ICECAST_RELAY_URL;
-	return (configured || "").trim();
-}
-
-function resolveIcecastRelayToken() {
-	const configured = (typeof window !== "undefined" && typeof window.VDO_NINJA_ICECAST_RELAY_TOKEN === "string" ? window.VDO_NINJA_ICECAST_RELAY_TOKEN : "") || readUrlParam("icecastrelaytoken");
-	return (configured || "").trim();
 }
 
 function buildRoomGate(defaults = {}) {
