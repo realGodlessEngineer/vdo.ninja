@@ -16,14 +16,18 @@
 		
 		</script>
 		<script>
-			if (new URLSearchParams(window.location.search).has('podcast')) {
-				document.write('<style>#directorlayout,#controlButtons{display:none!important}</style>');
+			if (new URLSearchParams(window.location.search).has("podcast")) {
+				document.documentElement.classList.add("podcast-mode");
 			}
 		</script>
 		<style>
 			html {
 				background-color: #0000;
 				transition: opacity .1s linear;
+			}
+			html.podcast-mode #directorlayout,
+			html.podcast-mode #controlButtons {
+				display: none !important;
 			}
 		</style>
 		<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
