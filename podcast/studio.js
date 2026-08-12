@@ -1,6 +1,7 @@
 import { waitForLegacySession, levelBus, LEVEL_EVENT, MultiTrackRecorder, CloudUploadCoordinator, bridgeLegacyMeters, monitorTrackLevel } from "../core/index.js";
 import { IcecastPublisher, ICECAST_MIME_OPTIONS } from "./icecast-publisher.js?v=2";
 import { readDiskRecordingState, isDiskRecordingEnabled, setDiskRecordingEnabled, verifyStoredDiskRecordingDirectory, chooseDiskRecordingDirectory, readDiskDirectoryHandle } from "./disk-recording-store.js?v=1";
+import { readCloudLinkStatus, isCloudLinkFresh, markCloudLinked, markCloudUnlinked } from "./cloud-link-store.js?v=1";
 
 const STUDIO_ROOT_ID = "podcast-root";
 const ROSTER_REFRESH_MS = 1500;
@@ -8,8 +9,6 @@ const PREFLIGHT_STORAGE_KEY = "podcastStudio.preflightState";
 const PREFLIGHT_CACHE_MS = 6 * 60 * 60 * 1000;
 const PREFLIGHT_MIN_MANDATORY_MS = 5 * 60 * 1000;
 const DROPBOX_GUIDE_URL = "/cloud.html#dropbox";
-const CLOUD_STATUS_STORAGE_KEY = "podcastStudio.cloudStatus";
-const CLOUD_STATUS_STALE_MS = 30 * 60 * 1000;
 const CAPTURE_MODE_STORAGE_KEY = "podcastStudio.captureMode";
 const ICECAST_SETTINGS_STORAGE_KEY = "podcastStudio.icecastSettings";
 const ICECAST_SETTINGS_VERSION = 2;
@@ -528,61 +527,6 @@ function snapshotHighResClock() {
 		timeOrigin: origin,
 		wallClockMs: Math.round(origin + now)
 	};
-}
-
-function readCloudLinkStatus() {
-	try {
-		const raw = window.localStorage.getItem(CLOUD_STATUS_STORAGE_KEY);
-		if (!raw) {
-			return {};
-		}
-		const parsed = JSON.parse(raw);
-		return parsed && typeof parsed === "object" ? parsed : {};
-	} catch (error) {
-		console.warn("Unable to read cloud link status", error);
-		return {};
-	}
-}
-
-function writeCloudLinkStatus(nextState) {
-	const snapshot = nextState || {};
-	try {
-		window.localStorage.setItem(CLOUD_STATUS_STORAGE_KEY, JSON.stringify(snapshot));
-	} catch (error) {
-		console.warn("Unable to persist cloud link status", error);
-		return;
-	}
-	dispatchStudioEvent(PODCAST_CLOUD_EVENT, { state: snapshot });
-}
-
-function isCloudLinkFresh(entry) {
-	if (!entry?.linkedAt) {
-		return false;
-	}
-	return Date.now() - entry.linkedAt < CLOUD_STATUS_STALE_MS;
-}
-
-function markCloudLinked(service, details = {}) {
-	if (!service) {
-		return;
-	}
-	const state = readCloudLinkStatus();
-	state[service] = {
-		linkedAt: Date.now(),
-		...details
-	};
-	writeCloudLinkStatus(state);
-}
-
-function markCloudUnlinked(service) {
-	if (!service) {
-		return;
-	}
-	const state = readCloudLinkStatus();
-	if (state[service]) {
-		delete state[service];
-		writeCloudLinkStatus(state);
-	}
 }
 
 function readCaptureMode() {
