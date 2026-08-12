@@ -3,11 +3,10 @@ import { IcecastPublisher, ICECAST_MIME_OPTIONS } from "./icecast-publisher.js?v
 import { readDiskRecordingState, isDiskRecordingEnabled, setDiskRecordingEnabled, verifyStoredDiskRecordingDirectory, chooseDiskRecordingDirectory, readDiskDirectoryHandle } from "./disk-recording-store.js?v=1";
 import { readCloudLinkStatus, isCloudLinkFresh, markCloudLinked, markCloudUnlinked } from "./cloud-link-store.js?v=1";
 import { readCaptureMode, writeCaptureMode } from "./capture-mode-store.js?v=1";
+import { readPreflightState, writePreflightState, isPreflightFresh } from "./preflight-store.js?v=1";
 
 const STUDIO_ROOT_ID = "podcast-root";
 const ROSTER_REFRESH_MS = 1500;
-const PREFLIGHT_STORAGE_KEY = "podcastStudio.preflightState";
-const PREFLIGHT_CACHE_MS = 6 * 60 * 60 * 1000;
 const PREFLIGHT_MIN_MANDATORY_MS = 5 * 60 * 1000;
 const DROPBOX_GUIDE_URL = "/cloud.html#dropbox";
 const ICECAST_SETTINGS_STORAGE_KEY = "podcastStudio.icecastSettings";
@@ -446,37 +445,6 @@ function persistStoredRoomState(state) {
 	} catch (error) {
 		console.warn("Unable to store room state", error);
 	}
-}
-
-function readPreflightState() {
-	try {
-		const raw = window.localStorage.getItem(PREFLIGHT_STORAGE_KEY);
-		if (!raw) {
-			return {};
-		}
-		const parsed = JSON.parse(raw);
-		if (parsed && typeof parsed === "object") {
-			return parsed;
-		}
-	} catch (error) {
-		console.warn("Unable to read preflight cache", error);
-	}
-	return {};
-}
-
-function writePreflightState(state) {
-	try {
-		window.localStorage.setItem(PREFLIGHT_STORAGE_KEY, JSON.stringify(state || {}));
-	} catch (error) {
-		console.warn("Unable to persist preflight cache", error);
-	}
-}
-
-function isPreflightFresh(timestamp) {
-	if (!timestamp) {
-		return false;
-	}
-	return Date.now() - timestamp < PREFLIGHT_CACHE_MS;
 }
 
 function formatRelativeTime(timestamp) {
