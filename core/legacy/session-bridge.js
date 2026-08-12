@@ -11,18 +11,41 @@ export function getLegacySession() {
 }
 
 export async function waitForLegacySession(options = {}) {
-	const { timeoutMs = 5000 } = options;
+	const { timeoutMs = 5000, signal } = options;
 	const start = performance.now();
 
 	while (true) {
+		if (signal?.aborted) {
+			throw abortReason(signal);
+		}
 		if (window.session) {
 			return window.session;
 		}
 		if (performance.now() - start > timeoutMs) {
 			throw new Error("Timed out waiting for legacy session initialisation.");
 		}
-		await new Promise(resolve => setTimeout(resolve, SESSION_POLL_MS));
+		await delay(SESSION_POLL_MS, signal);
 	}
+}
+
+// setTimeout-based delay that rejects early if an optional AbortSignal fires mid-wait.
+function delay(ms, signal) {
+	return new Promise((resolve, reject) => {
+		const timer = setTimeout(() => {
+			signal?.removeEventListener("abort", onAbort);
+			resolve();
+		}, ms);
+		function onAbort() {
+			clearTimeout(timer);
+			reject(abortReason(signal));
+		}
+		signal?.addEventListener("abort", onAbort, { once: true });
+	});
+}
+
+// AbortSignal.reason defaults to an AbortError DOMException in modern browsers; fall back for older engines that leave it undefined.
+function abortReason(signal) {
+	return signal.reason !== undefined ? signal.reason : new DOMException("Wait for legacy session was aborted.", "AbortError");
 }
 
 export function onLegacyEvent(eventName, handler) {

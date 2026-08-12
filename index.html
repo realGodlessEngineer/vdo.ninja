@@ -3387,52 +3387,55 @@
 		<script type="text/javascript" crossorigin="anonymous" src="./auth-client.js?v=8"></script>
 
 				<script type="text/javascript">
-					function toggleSSOOptions(enabled){
-						var box = document.getElementById('ssoOptions');
-					if (!box) return;
-					box.style.display = enabled ? 'block' : 'none';
-					var passwordInput = document.getElementById('passwordRoom');
-					if (passwordInput) {
-						if (enabled) {
-							passwordInput.value = '';
-							passwordInput.disabled = true;
-						} else {
-							passwordInput.disabled = false;
+					function toggleSSOOptions(enabled) {
+						const box = document.getElementById("ssoOptions");
+						if (!box) return;
+						box.style.display = enabled ? "block" : "none";
+						const passwordInput = document.getElementById("passwordRoom");
+						if (passwordInput) {
+							if (enabled) {
+								passwordInput.value = "";
+								passwordInput.disabled = true;
+							} else {
+								passwordInput.disabled = false;
+							}
 						}
+						const passwordNote = document.getElementById("passwordRoomSSONote");
+						if (passwordNote) {
+							passwordNote.style.display = enabled ? "block" : "none";
+						}
+						const listRow = document.getElementById("preAllowlistRow");
+						if (!enabled) {
+							if (listRow) listRow.style.display = "none";
+							return;
+						}
+						// Ensure allowlist row reflects current selection
+						try {
+							const selected = document.querySelector('input[name="ssoAccessMode"]:checked');
+							if (selected && selected.value === "allowlist") {
+								if (listRow) listRow.style.display = "block";
+							} else {
+								if (listRow) listRow.style.display = "none";
+							}
+						} catch (e) {}
 					}
-					var passwordNote = document.getElementById('passwordRoomSSONote');
-					if (passwordNote) {
-						passwordNote.style.display = enabled ? 'block' : 'none';
-					}
-					var listRow = document.getElementById('preAllowlistRow');
-					if (!enabled) { if (listRow) listRow.style.display='none'; return; }
-					// Ensure allowlist row reflects current selection
-					try {
-						var selected = document.querySelector('input[name="ssoAccessMode"]:checked');
-					if (selected && selected.value === 'allowlist') {
-						if (listRow) listRow.style.display='block';
-					} else {
-						if (listRow) listRow.style.display='none';
-					}
-					} catch(e){}
-				}
-					(function initSSOOptionsState(){
-						var ssoToggle = document.getElementById('useSSOForRoom');
+					(function initSSOOptionsState() {
+						const ssoToggle = document.getElementById("useSSOForRoom");
 						if (ssoToggle) {
 							try {
-								var params = new URLSearchParams(window.location.search);
-								ssoToggle.checked = params.has('auth') || params.has('requireauth');
+								const params = new URLSearchParams(window.location.search);
+								ssoToggle.checked = params.has("auth") || params.has("requireauth");
 							} catch (e) {
 								ssoToggle.checked = false;
 							}
 							toggleSSOOptions(!!ssoToggle.checked);
 						}
 					})();
-					(function initRoomApprovalState(){
-						var roomApprovalToggle = document.getElementById('requireApprovalForRoom');
+					(function initRoomApprovalState() {
+						const roomApprovalToggle = document.getElementById("requireApprovalForRoom");
 						if (!roomApprovalToggle) return;
 						try {
-							roomApprovalToggle.checked = new URLSearchParams(window.location.search).has('requireapproval');
+							roomApprovalToggle.checked = new URLSearchParams(window.location.search).has("requireapproval");
 						} catch (e) {}
 					})();
 				</script>
