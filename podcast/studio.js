@@ -2,6 +2,7 @@ import { waitForLegacySession, levelBus, LEVEL_EVENT, MultiTrackRecorder, CloudU
 import { IcecastPublisher, ICECAST_MIME_OPTIONS } from "./icecast-publisher.js?v=2";
 import { readDiskRecordingState, isDiskRecordingEnabled, setDiskRecordingEnabled, verifyStoredDiskRecordingDirectory, chooseDiskRecordingDirectory, readDiskDirectoryHandle } from "./disk-recording-store.js?v=1";
 import { readCloudLinkStatus, isCloudLinkFresh, markCloudLinked, markCloudUnlinked } from "./cloud-link-store.js?v=1";
+import { readCaptureMode, writeCaptureMode } from "./capture-mode-store.js?v=1";
 
 const STUDIO_ROOT_ID = "podcast-root";
 const ROSTER_REFRESH_MS = 1500;
@@ -9,7 +10,6 @@ const PREFLIGHT_STORAGE_KEY = "podcastStudio.preflightState";
 const PREFLIGHT_CACHE_MS = 6 * 60 * 60 * 1000;
 const PREFLIGHT_MIN_MANDATORY_MS = 5 * 60 * 1000;
 const DROPBOX_GUIDE_URL = "/cloud.html#dropbox";
-const CAPTURE_MODE_STORAGE_KEY = "podcastStudio.captureMode";
 const ICECAST_SETTINGS_STORAGE_KEY = "podcastStudio.icecastSettings";
 const ICECAST_SETTINGS_VERSION = 2;
 const DEFAULT_ICECAST_MIME_TYPE = ICECAST_MIME_OPTIONS[0].value;
@@ -527,29 +527,6 @@ function snapshotHighResClock() {
 		timeOrigin: origin,
 		wallClockMs: Math.round(origin + now)
 	};
-}
-
-function readCaptureMode() {
-	try {
-		const raw = window.localStorage.getItem(CAPTURE_MODE_STORAGE_KEY);
-		const normalized = (raw || "audio").toString().toLowerCase();
-		if (normalized === "video") {
-			return "video";
-		}
-	} catch (error) {
-		console.warn("Unable to read capture mode", error);
-	}
-	return "audio";
-}
-
-function writeCaptureMode(mode) {
-	const normalized = mode === "video" ? "video" : "audio";
-	try {
-		window.localStorage.setItem(CAPTURE_MODE_STORAGE_KEY, normalized);
-	} catch (error) {
-		console.warn("Unable to persist capture mode", error);
-	}
-	return normalized;
 }
 
 function readIcecastSettings() {
