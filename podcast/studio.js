@@ -7,6 +7,7 @@ import { readPreflightState, writePreflightState, isPreflightFresh } from "./pre
 import { readIcecastSettings, writeIcecastSettings, resolveIcecastRelayUrl, resolveIcecastRelayToken, DEFAULT_ICECAST_MIME_TYPE } from "./icecast-settings-store.js?v=1";
 import { ROOM_QUERY_KEYS, DIRECTOR_QUERY_KEYS, sanitizeRoomSlug, getRoomSlugFromParams, readStoredRoomState, persistStoredRoomState } from "./room-state-store.js?v=1";
 import { SpectrogramRenderer } from "./spectrogram-renderer.js?v=1";
+import { injectStylesheet, createElement, makeCollapsible } from "./dom-helpers.js?v=1";
 
 const STUDIO_ROOT_ID = "podcast-root";
 const ROSTER_REFRESH_MS = 1500;
@@ -45,77 +46,6 @@ const STUDIO_DISK_FEATURE_FLAG = (() => {
 })();
 
 const STUDIO_VIDEO_FEATURE_FLAG = true;
-
-function injectStylesheet() {
-	if (document.getElementById("podcast-studio-style")) {
-		return;
-	}
-	const link = document.createElement("link");
-	link.id = "podcast-studio-style";
-	link.rel = "stylesheet";
-	link.href = new URL("./studio.css?v=15", import.meta.url).toString();
-	document.head.appendChild(link);
-}
-
-function createElement(tag, className, attrs = {}) {
-	const el = document.createElement(tag);
-	if (className) {
-		el.className = className;
-	}
-	Object.entries(attrs).forEach(([key, value]) => {
-		if (value === undefined || value === null) {
-			return;
-		}
-		if (key === "text") {
-			el.textContent = value;
-		} else {
-			el.setAttribute(key, value);
-		}
-	});
-	return el;
-}
-
-function makeCollapsible(panel, title, storageKey = null) {
-	panel.dataset.collapsible = "true";
-
-	// Add title h2 if provided and panel doesn't already have one
-	if (title && !panel.querySelector("h2")) {
-		const h2 = createElement("h2", "", { text: title });
-		panel.insertBefore(h2, panel.firstChild);
-	}
-
-	// Create toggle button (will be positioned absolute in top right via CSS)
-	const toggle = createElement("button", "panel-collapse-toggle", { type: "button", text: "−", title: "Collapse section" });
-
-	// Load saved state
-	let collapsed = false;
-	if (storageKey) {
-		try {
-			collapsed = localStorage.getItem(storageKey) === "true";
-		} catch (e) {}
-	}
-
-	const updateState = () => {
-		panel.dataset.collapsed = collapsed ? "true" : "false";
-		toggle.textContent = collapsed ? "+" : "−";
-		toggle.title = collapsed ? "Expand section" : "Collapse section";
-		if (storageKey) {
-			try {
-				localStorage.setItem(storageKey, collapsed ? "true" : "false");
-			} catch (e) {}
-		}
-	};
-
-	toggle.addEventListener("click", () => {
-		collapsed = !collapsed;
-		updateState();
-	});
-
-	panel.appendChild(toggle);
-	updateState();
-
-	return { toggle };
-}
 
 function dispatchStudioEvent(name, detail = {}) {
 	if (typeof window === "undefined" || typeof window.dispatchEvent !== "function") {
