@@ -9,6 +9,7 @@ import { ROOM_QUERY_KEYS, DIRECTOR_QUERY_KEYS, sanitizeRoomSlug, getRoomSlugFrom
 import { SpectrogramRenderer } from "./spectrogram-renderer.js?v=1";
 import { injectStylesheet, createElement, makeCollapsible } from "./dom-helpers.js?v=1";
 import { formatRelativeTime } from "./time-format.js?v=1";
+import { createRecordingSessionId, snapshotHighResClock } from "./recording-session-utils.js?v=1";
 
 const STUDIO_ROOT_ID = "podcast-root";
 const ROSTER_REFRESH_MS = 1500;
@@ -57,30 +58,6 @@ function dispatchStudioEvent(name, detail = {}) {
 	} catch (error) {
 		console.warn("Unable to dispatch studio event", name, error);
 	}
-}
-
-function createRecordingSessionId() {
-	try {
-		if (typeof crypto !== "undefined" && crypto.randomUUID) {
-			return crypto.randomUUID();
-		}
-	} catch (error) {
-		console.warn("randomUUID unavailable", error);
-	}
-	return `rec-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function snapshotHighResClock() {
-	if (typeof performance === "undefined" || typeof performance.now !== "function") {
-		return null;
-	}
-	const now = performance.now();
-	const origin = typeof performance.timeOrigin === "number" ? performance.timeOrigin : Date.now() - now;
-	return {
-		perfNow: now,
-		timeOrigin: origin,
-		wallClockMs: Math.round(origin + now)
-	};
 }
 
 function buildRoomGate(defaults = {}) {
