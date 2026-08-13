@@ -5,6 +5,7 @@ import { readCloudLinkStatus, isCloudLinkFresh, markCloudLinked, markCloudUnlink
 import { readCaptureMode, writeCaptureMode } from "./capture-mode-store.js?v=1";
 import { readPreflightState, writePreflightState, isPreflightFresh } from "./preflight-store.js?v=1";
 import { readIcecastSettings, writeIcecastSettings, resolveIcecastRelayUrl, resolveIcecastRelayToken, DEFAULT_ICECAST_MIME_TYPE } from "./icecast-settings-store.js?v=1";
+import { ROOM_QUERY_KEYS, DIRECTOR_QUERY_KEYS, sanitizeRoomSlug, getRoomSlugFromParams, readStoredRoomState, persistStoredRoomState } from "./room-state-store.js?v=1";
 
 const STUDIO_ROOT_ID = "podcast-root";
 const ROSTER_REFRESH_MS = 1500;
@@ -372,75 +373,6 @@ class SpectrogramRenderer {
 		if (this.ctx && this.canvas) {
 			this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
 		}
-	}
-}
-
-const ROOM_QUERY_KEYS = ["room", "roomid", "r"];
-const DIRECTOR_QUERY_KEYS = ["director", "dir"];
-const ROOM_STATE_STORAGE_KEY = "podcastStudio.lastRoom";
-
-function sanitizeRoomSlug(value) {
-	if (!value) {
-		return "";
-	}
-	const trimmed = String(value).trim();
-	if (!trimmed) {
-		return "";
-	}
-	try {
-		if (typeof window.sanitizeRoomName === "function") {
-			return window.sanitizeRoomName(trimmed);
-		}
-	} catch (error) {
-		console.warn("sanitizeRoomName unavailable", error);
-	}
-	return trimmed.replace(/[^a-zA-Z0-9_\-]/g, "").slice(0, 64);
-}
-
-function getRoomSlugFromParams(params = new URLSearchParams(window.location.search)) {
-	for (const key of DIRECTOR_QUERY_KEYS) {
-		if (params.has(key)) {
-			const slug = sanitizeRoomSlug(params.get(key));
-			if (slug) {
-				return slug;
-			}
-		}
-	}
-	for (const key of ROOM_QUERY_KEYS) {
-		if (params.has(key)) {
-			const slug = sanitizeRoomSlug(params.get(key));
-			if (slug) {
-				return slug;
-			}
-		}
-	}
-	return "";
-}
-
-function readStoredRoomState() {
-	try {
-		const raw = window.localStorage.getItem(ROOM_STATE_STORAGE_KEY);
-		if (!raw) {
-			return {};
-		}
-		const parsed = JSON.parse(raw);
-		if (parsed && typeof parsed === "object") {
-			return {
-				room: typeof parsed.room === "string" ? parsed.room : "",
-				password: typeof parsed.password === "string" ? parsed.password : ""
-			};
-		}
-	} catch (error) {
-		console.warn("Unable to read stored room state", error);
-	}
-	return {};
-}
-
-function persistStoredRoomState(state) {
-	try {
-		window.localStorage.setItem(ROOM_STATE_STORAGE_KEY, JSON.stringify(state || {}));
-	} catch (error) {
-		console.warn("Unable to store room state", error);
 	}
 }
 
