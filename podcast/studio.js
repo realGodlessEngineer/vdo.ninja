@@ -11,6 +11,7 @@ import { injectStylesheet, createElement, makeCollapsible } from "./dom-helpers.
 import { formatRelativeTime } from "./time-format.js?v=1";
 import { createRecordingSessionId, snapshotHighResClock } from "./recording-session-utils.js?v=1";
 import { runPreflightChecklist } from "./preflight-checklist.js?v=1";
+import { MarkerLog } from "./marker-log.js?v=1";
 
 const STUDIO_ROOT_ID = "podcast-root";
 const ROSTER_REFRESH_MS = 1500;
@@ -271,12 +272,7 @@ class PodcastStudioApp {
 		this.trackLevelNodes = new Map();
 		this.spectrograms = new Map();
 		this.participantMetrics = new Map();
-		this.markers = [];
-		this.markerActions = null;
-		this.markerExportButton = null;
-		this.markerCopyButton = null;
-		this.markerCopyResetTimer = null;
-		this.autoMarkerTimeout = null;
+		this.markerLog = null;
 		this.rosterTimer = null;
 		this.levelOff = null;
 		this.recordStartedAt = null;
@@ -1411,18 +1407,24 @@ class PodcastStudioApp {
 		makeCollapsible(rosterPanel, "Talent Roster", "podcastStudio.collapse.roster");
 
 		const markersPanel = createElement("section", "podcast-panel");
-		this.markerLog = createElement("div", "marker-log");
-		const emptyMarkers = createElement("div", "empty-state", { text: "Tap “Marker” to drop cue points during recording." });
-		emptyMarkers.dataset.empty = "true";
-		this.markerLog.append(emptyMarkers);
-		this.markerActions = createElement("div", "cloud-sync-list__actions marker-actions");
-		this.markerActions.style.display = "none";
-		this.markerExportButton = createElement("button", "cloud-sync-list__button", { type: "button", text: "Export CSV", title: "Download markers as a CSV file." });
-		this.markerExportButton.addEventListener("click", () => this.exportMarkersCsv());
-		this.markerCopyButton = createElement("button", "cloud-sync-list__button", { type: "button", text: "Copy CSV", title: "Copy markers CSV to clipboard." });
-		this.markerCopyButton.addEventListener("click", () => this.copyMarkersCsv());
-		this.markerActions.append(this.markerExportButton, this.markerCopyButton);
-		markersPanel.append(this.markerLog, this.markerActions);
+		const markerLogEl = createElement("div", "marker-log");
+		const markerActions = createElement("div", "cloud-sync-list__actions marker-actions");
+		markerActions.style.display = "none";
+		const markerExportButton = createElement("button", "cloud-sync-list__button", { type: "button", text: "Export CSV", title: "Download markers as a CSV file." });
+		const markerCopyButton = createElement("button", "cloud-sync-list__button", { type: "button", text: "Copy CSV", title: "Copy markers CSV to clipboard." });
+		markerActions.append(markerExportButton, markerCopyButton);
+		this.markerLog = new MarkerLog({
+			logEl: markerLogEl,
+			actionsEl: markerActions,
+			exportButton: markerExportButton,
+			copyButton: markerCopyButton,
+			isRecording: () => this.recording,
+			getElapsedSeconds: () => (this.recording ? (Date.now() - this.recordStartedAt) / 1000 : 0),
+			getSessionId: () => this.recordingSessionId || this.recordingPlan?.sessionId,
+			onEvent: (type, data) => this.logRecordingEvent(type, data)
+		});
+		this.markerLog.render();
+		markersPanel.append(markerLogEl, markerActions);
 		makeCollapsible(markersPanel, "Session Markers", "podcastStudio.collapse.markers");
 
 		rosterColumn.append(hostPanel, rosterPanel, markersPanel);
@@ -1500,7 +1502,7 @@ class PodcastStudioApp {
 		this.recordButton.addEventListener("click", () => this.handleRecordToggle());
 		this.markerButton = createElement("button", "btn-secondary", { type: "button", text: "Marker", title: "Drop a cue marker at the current time." });
 		this.markerButton.disabled = true;
-		this.markerButton.addEventListener("click", () => this.addMarker());
+		this.markerButton.addEventListener("click", () => this.markerLog.addManual());
 		const captureSelectId = "podcast-capture-mode";
 		const captureModeLabel = createElement("label", "capture-mode-label", { text: "Capture" });
 		captureModeLabel.setAttribute("for", captureSelectId);
@@ -2206,9 +2208,8 @@ class PodcastStudioApp {
 			this.recording = true;
 			this.recordTransitioning = false;
 			this.recordStartedAt = event?.detail?.startedAt || Date.now();
-			this.markers = [];
-			this.renderMarkers();
-			this.scheduleAutoSyncMarker();
+			this.markerLog.reset();
+			this.markerLog.scheduleAutoSync();
 			this.updateRecordingButtons();
 			this.markerButton.disabled = false;
 			this.showOutputsMessage("Recording… tracks will appear as media arrives.");
@@ -2302,10 +2303,7 @@ class PodcastStudioApp {
 			this.stopRecordingStatusTimer();
 			this.updateRecordingButtons();
 			this.markerButton.disabled = true;
-			if (this.autoMarkerTimeout) {
-				clearTimeout(this.autoMarkerTimeout);
-				this.autoMarkerTimeout = null;
-			}
+			this.markerLog.clearAutoTimer();
 			this.showOutputsMessage("Finalising recordings…");
 			this.trackLevelNodes.clear();
 			this.teardownSpectrograms();
@@ -2801,11 +2799,8 @@ class PodcastStudioApp {
 			if (this.markerButton) {
 				this.markerButton.disabled = true;
 			}
-			if (this.autoMarkerTimeout) {
-				clearTimeout(this.autoMarkerTimeout);
-				this.autoMarkerTimeout = null;
-			}
-			const markerSnapshot = this.markers.map(marker => ({ ...marker }));
+			this.markerLog.clearAutoTimer();
+			const markerSnapshot = this.markerLog.snapshot();
 			try {
 				await this.recorder.stop({ markers: markerSnapshot });
 			} catch (error) {
@@ -2897,9 +2892,7 @@ class PodcastStudioApp {
 				auto: true,
 				joinSync: true
 			};
-			this.markers.push(note);
-			this.logRecordingEvent("marker", { label: note.label, timeSeconds: note.time, auto: true, joinSync: true });
-			this.renderMarkers();
+			this.markerLog.add(note);
 		}, 1000);
 	}
 
@@ -2979,193 +2972,6 @@ class PodcastStudioApp {
 			}
 		}
 		this.updateCloudFooter();
-	}
-
-	addMarker() {
-		if (!this.recording) {
-			return;
-		}
-		const timestamp = this.recordStartedAt ? (Date.now() - this.recordStartedAt) / 1000 : 0;
-		const note = {
-			time: timestamp,
-			label: `Marker @ ${timestamp.toFixed(1)}s`
-		};
-		this.markers.push(note);
-		this.logRecordingEvent("marker", { label: note.label, timeSeconds: note.time });
-		this.renderMarkers();
-	}
-
-	scheduleAutoSyncMarker() {
-		if (this.autoMarkerTimeout) {
-			return;
-		}
-		this.autoMarkerTimeout = setTimeout(() => {
-			this.autoMarkerTimeout = null;
-			if (!this.recording) {
-				return;
-			}
-			const timestamp = this.recordStartedAt ? (Date.now() - this.recordStartedAt) / 1000 : 1;
-			const note = {
-				time: timestamp,
-				label: `Auto sync @ ${timestamp.toFixed(1)}s`,
-				auto: true
-			};
-			this.markers.push(note);
-			this.logRecordingEvent("marker", { label: note.label, timeSeconds: note.time, auto: true });
-			this.renderMarkers();
-		}, 1000);
-	}
-
-	escapeCsvValue(value) {
-		const raw = value === null || typeof value === "undefined" ? "" : String(value);
-		const escaped = raw.replace(/\"/g, '""');
-		return `"${escaped}"`;
-	}
-
-	formatMarkerTimecode(seconds) {
-		const safeSeconds = Number.isFinite(seconds) ? Math.max(0, seconds) : 0;
-		const totalMs = Math.round(safeSeconds * 1000);
-		const hours = Math.floor(totalMs / 3600000);
-		const minutes = Math.floor((totalMs % 3600000) / 60000);
-		const secs = Math.floor((totalMs % 60000) / 1000);
-		const ms = totalMs % 1000;
-		if (hours > 0) {
-			return `${hours}:${minutes.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}.${ms.toString().padStart(3, "0")}`;
-		}
-		return `${minutes}:${secs.toString().padStart(2, "0")}.${ms.toString().padStart(3, "0")}`;
-	}
-
-	buildMarkersCsv() {
-		const markers = Array.isArray(this.markers) ? this.markers : [];
-		const header = ["index", "time_seconds", "timecode", "label", "auto"].join(",");
-		if (!markers.length) {
-			return `${header}\n`;
-		}
-		const rows = markers.map((marker, index) => {
-			const timeSeconds = Number.isFinite(marker?.time) ? marker.time : 0;
-			const timecode = this.formatMarkerTimecode(timeSeconds);
-			const label = marker?.label || `Marker #${index + 1}`;
-			const auto = marker?.auto ? "1" : "0";
-			return [index + 1, timeSeconds.toFixed(3), this.escapeCsvValue(timecode), this.escapeCsvValue(label), auto].join(",");
-		});
-		return `${header}\n${rows.join("\n")}\n`;
-	}
-
-	buildMarkersFilename() {
-		const sessionId = this.recordingSessionId || this.recordingPlan?.sessionId || "session";
-		const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-		return `vdo-ninja-markers-${sessionId}-${timestamp}.csv`;
-	}
-
-	exportMarkersCsv() {
-		if (!this.markerExportButton) {
-			return;
-		}
-		const csv = this.buildMarkersCsv();
-		if (!csv.trim()) {
-			return;
-		}
-		// Visual feedback while preparing download
-		const originalText = this.markerExportButton.textContent;
-		this.markerExportButton.textContent = "Exporting…";
-		this.markerExportButton.disabled = true;
-
-		// Small delay to show feedback before download triggers
-		setTimeout(() => {
-			const blob = new Blob([csv], { type: "text/csv" });
-			const url = URL.createObjectURL(blob);
-			try {
-				const link = document.createElement("a");
-				link.href = url;
-				link.download = this.buildMarkersFilename();
-				link.rel = "noopener";
-				link.click();
-				this.markerExportButton.textContent = "Exported";
-			} catch (error) {
-				console.warn("Failed to trigger CSV download", error);
-				this.markerExportButton.textContent = "Export failed";
-			} finally {
-				setTimeout(() => URL.revokeObjectURL(url), 100);
-				// Restore button after a moment
-				setTimeout(() => {
-					if (this.markerExportButton) {
-						this.markerExportButton.textContent = originalText;
-						this.markerExportButton.disabled = false;
-					}
-				}, 1500);
-			}
-		}, 50);
-	}
-
-	async copyMarkersCsv() {
-		if (!this.markerCopyButton) {
-			return;
-		}
-		const csv = this.buildMarkersCsv();
-		if (!csv.trim()) {
-			return;
-		}
-		try {
-			if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
-				await navigator.clipboard.writeText(csv);
-			} else {
-				const textarea = document.createElement("textarea");
-				textarea.value = csv;
-				textarea.setAttribute("readonly", "true");
-				textarea.style.position = "fixed";
-				textarea.style.left = "-9999px";
-				document.body.append(textarea);
-				textarea.select();
-				document.execCommand("copy");
-				textarea.remove();
-			}
-			this.markerCopyButton.textContent = "Copied";
-			if (this.markerCopyResetTimer) {
-				clearTimeout(this.markerCopyResetTimer);
-			}
-			this.markerCopyResetTimer = setTimeout(() => {
-				this.markerCopyResetTimer = null;
-				if (this.markerCopyButton) {
-					this.markerCopyButton.textContent = "Copy CSV";
-				}
-			}, 1500);
-		} catch (error) {
-			console.warn("Copy markers failed", error);
-			this.markerCopyButton.textContent = "Copy failed";
-			if (this.markerCopyResetTimer) {
-				clearTimeout(this.markerCopyResetTimer);
-			}
-			this.markerCopyResetTimer = setTimeout(() => {
-				this.markerCopyResetTimer = null;
-				if (this.markerCopyButton) {
-					this.markerCopyButton.textContent = "Copy CSV";
-				}
-			}, 2000);
-		}
-	}
-
-	renderMarkers() {
-		this.markerLog.innerHTML = "";
-		if (this.markerActions) {
-			this.markerActions.style.display = this.markers.length ? "" : "none";
-		}
-		if (!this.markers.length) {
-			const empty = createElement("div", "empty-state", { text: "Tap “Marker” to drop cue points during recording." });
-			empty.dataset.empty = "true";
-			this.markerLog.append(empty);
-			return;
-		}
-		// Render newest markers first (reverse order) so they appear at the top
-		for (let i = this.markers.length - 1; i >= 0; i -= 1) {
-			const marker = this.markers[i];
-			const timeSeconds = Number.isFinite(marker?.time) ? marker.time : 0;
-			const timecode = this.formatMarkerTimecode(timeSeconds);
-			const item = createElement("div", "marker-item");
-			item.title = `${marker?.auto ? "Auto sync" : "Marker"} @ ${timecode}`;
-			item.append(createElement("span", "", { text: marker.label }));
-			item.append(createElement("span", "marker-badge", { text: `#${i + 1}` }));
-			this.markerLog.append(item);
-		}
 	}
 
 	startRosterLoop() {
