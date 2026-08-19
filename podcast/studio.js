@@ -1,10 +1,9 @@
 import { waitForLegacySession, levelBus, LEVEL_EVENT, MultiTrackRecorder, CloudUploadCoordinator, bridgeLegacyMeters, monitorTrackLevel } from "../core/index.js";
-import { IcecastPublisher, ICECAST_MIME_OPTIONS } from "./icecast-publisher.js?v=2";
 import { readDiskRecordingState, isDiskRecordingEnabled, setDiskRecordingEnabled, verifyStoredDiskRecordingDirectory, chooseDiskRecordingDirectory, readDiskDirectoryHandle } from "./disk-recording-store.js?v=1";
 import { readCloudLinkStatus, isCloudLinkFresh, markCloudLinked, markCloudUnlinked } from "./cloud-link-store.js?v=1";
 import { readCaptureMode, writeCaptureMode } from "./capture-mode-store.js?v=1";
 import { readPreflightState, writePreflightState, isPreflightFresh } from "./preflight-store.js?v=1";
-import { readIcecastSettings, writeIcecastSettings, resolveIcecastRelayUrl, resolveIcecastRelayToken, DEFAULT_ICECAST_MIME_TYPE } from "./icecast-settings-store.js?v=1";
+import { IcecastController } from "./icecast-controller.js?v=1";
 import { ROOM_QUERY_KEYS, DIRECTOR_QUERY_KEYS, sanitizeRoomSlug, getRoomSlugFromParams, readStoredRoomState, persistStoredRoomState } from "./room-state-store.js?v=1";
 import { SpectrogramRenderer } from "./spectrogram-renderer.js?v=1";
 import { injectStylesheet, createElement, makeCollapsible } from "./dom-helpers.js?v=1";
@@ -374,21 +373,7 @@ class PodcastStudioApp {
 		this.guestBackupButton = null;
 		this.guestBackupStatusNode = null;
 		this.currentRecordingMode = readCaptureMode();
-		this.icecastPublisher = null;
-		this.icecastButton = null;
-		this.icecastSettingsButton = null;
-		this.icecastSettingsPanel = null;
-		this.icecastStatusNode = null;
-		this.icecastTargetInput = null;
-		this.icecastUsernameInput = null;
-		this.icecastPasswordInput = null;
-		this.icecastMimeSelect = null;
-		this.icecastPublicInput = null;
-		this.icecastNameInput = null;
-		this.icecastGenreInput = null;
-		this.icecastLive = false;
-		this.icecastBusy = false;
-		this.icecastSettingsOpen = false;
+		this.icecastController = null;
 	}
 
 	async init() {
@@ -406,16 +391,19 @@ class PodcastStudioApp {
 			monitorLevels: true,
 			timeslice: 1000
 		});
-		this.icecastPublisher = new IcecastPublisher({
-			audioContext: this.audioContext,
-			getParticipants: () => this.getIcecastMixParticipants()
+		this.icecastController = new IcecastController({
+			getAudioContext: () => this.audioContext,
+			ensureAudioContextResumed: () => this.ensureAudioContextResumed(),
+			getMixParticipants: () => this.getIcecastMixParticipants(),
+			formatFileSize: bytes => this.formatFileSize(bytes),
+			formatDuration: seconds => this.formatDuration(seconds),
+			onReadinessChange: () => this.updateReadinessSummary()
 		});
-		this.attachIcecastEvents();
 		this.cloud = new CloudUploadCoordinator(this.session);
 
 		this.roomName = this.resolveRoomName();
 		this.buildLayout();
-		this.updateIcecastUI();
+		this.icecastController.updateUI();
 		this.updateReadinessSummary();
 		this.updateRecordingButtons();
 		if (STUDIO_DISK_FEATURE_FLAG) {
@@ -1188,36 +1176,6 @@ class PodcastStudioApp {
 		return new AudioCtx();
 	}
 
-	attachIcecastEvents() {
-		if (!this.icecastPublisher) {
-			return;
-		}
-		this.icecastPublisher.addEventListener("status", event => {
-			const detail = event.detail || {};
-			const state = detail.state === "live" ? "ready" : detail.state === "connecting" ? "pending" : detail.state || "idle";
-			this.icecastLive = state === "ready" || state === "pending";
-			this.setIcecastStatus(detail.message || "Icecast idle.", state);
-			this.updateIcecastUI();
-			this.updateReadinessSummary();
-		});
-		this.icecastPublisher.addEventListener("progress", event => {
-			const detail = event.detail || {};
-			if (!this.icecastPublisher?.isLive()) {
-				return;
-			}
-			const elapsedSeconds = detail.startedAt ? Math.max(1, Math.round((Date.now() - detail.startedAt) / 1000)) : 0;
-			const bytes = detail.bytesSent || 0;
-			this.setIcecastStatus(`Live ${this.formatFileSize(bytes)}${elapsedSeconds ? ` / ${this.formatDuration(elapsedSeconds)}` : ""}`, "ready");
-		});
-		this.icecastPublisher.addEventListener("error", event => {
-			const error = event.detail;
-			this.icecastLive = false;
-			this.setIcecastStatus(error?.message || "Icecast publish failed.", "error");
-			this.updateIcecastUI();
-			this.updateReadinessSummary();
-		});
-	}
-
 	getIcecastMixParticipants() {
 		const participants = [];
 		Object.entries(this.session?.rpcs || {}).forEach(([uuid, peer]) => {
@@ -1239,129 +1197,6 @@ class PodcastStudioApp {
 			}
 		});
 		return participants;
-	}
-
-	collectIcecastSettingsFromForm() {
-		const targetUrl = (this.icecastTargetInput?.value || "").trim();
-		const username = (this.icecastUsernameInput?.value || "source").trim() || "source";
-		const password = this.icecastPasswordInput?.value || "";
-		const mimeType = this.icecastMimeSelect?.value || ICECAST_MIME_OPTIONS[0].value;
-		const isPublic = Boolean(this.icecastPublicInput?.checked);
-		const name = (this.icecastNameInput?.value || "").trim();
-		const genre = (this.icecastGenreInput?.value || "").trim();
-		return {
-			targetUrl,
-			username,
-			password,
-			mimeType,
-			public: isPublic,
-			name,
-			genre
-		};
-	}
-
-	persistIcecastSettingsFromForm() {
-		writeIcecastSettings(this.collectIcecastSettingsFromForm());
-	}
-
-	readIcecastConfigFromForm() {
-		const storedSettings = this.collectIcecastSettingsFromForm();
-		const relayUrl = resolveIcecastRelayUrl(storedSettings);
-		const relayToken = resolveIcecastRelayToken();
-		writeIcecastSettings(storedSettings);
-		return {
-			relayUrl,
-			targetUrl: storedSettings.targetUrl,
-			username: storedSettings.username,
-			password: storedSettings.password,
-			relayToken,
-			mimeType: storedSettings.mimeType,
-			metadata: {
-				name: storedSettings.name || "VDO.Ninja Live",
-				genre: storedSettings.genre || "Live",
-				public: storedSettings.public
-			}
-		};
-	}
-
-	setIcecastStatus(message, state = "idle") {
-		if (!this.icecastStatusNode) {
-			return;
-		}
-		this.icecastStatusNode.textContent = message || "Idle";
-		this.icecastStatusNode.dataset.state = state;
-	}
-
-	updateIcecastUI() {
-		const live = Boolean(this.icecastPublisher?.isLive());
-		this.icecastLive = live;
-		if (this.icecastButton) {
-			this.icecastButton.disabled = this.icecastBusy;
-			this.icecastButton.textContent = live ? "Stop live" : this.icecastBusy ? "Starting..." : "Start live";
-			this.icecastButton.dataset.state = live ? "enabled" : "idle";
-		}
-		if (this.icecastSettingsButton) {
-			this.icecastSettingsButton.disabled = live || this.icecastBusy;
-			this.icecastSettingsButton.textContent = this.icecastSettingsOpen ? "Hide settings" : "Settings";
-			this.icecastSettingsButton.setAttribute("aria-expanded", this.icecastSettingsOpen ? "true" : "false");
-		}
-		if (this.icecastSettingsPanel) {
-			this.icecastSettingsPanel.hidden = !this.icecastSettingsOpen;
-		}
-		[this.icecastTargetInput, this.icecastUsernameInput, this.icecastPasswordInput, this.icecastMimeSelect, this.icecastPublicInput, this.icecastNameInput, this.icecastGenreInput].forEach(node => {
-			if (node) {
-				node.disabled = live || this.icecastBusy;
-			}
-		});
-	}
-
-	toggleIcecastSettings() {
-		if (this.icecastPublisher?.isLive() || this.icecastBusy) {
-			return;
-		}
-		this.icecastSettingsOpen = !this.icecastSettingsOpen;
-		this.updateIcecastUI();
-	}
-
-	async handleIcecastToggle() {
-		if (!this.icecastPublisher || this.icecastBusy) {
-			return;
-		}
-		if (this.icecastPublisher.isLive()) {
-			this.icecastBusy = true;
-			this.updateIcecastUI();
-			this.setIcecastStatus("Stopping...", "pending");
-			try {
-				await this.icecastPublisher.stop();
-			} catch (error) {
-				console.warn("Failed to stop Icecast publisher", error);
-				this.setIcecastStatus(error?.message || "Stop failed.", "error");
-			} finally {
-				this.icecastBusy = false;
-				this.icecastLive = false;
-				this.updateIcecastUI();
-				this.updateReadinessSummary();
-			}
-			return;
-		}
-		this.icecastBusy = true;
-		this.updateIcecastUI();
-		this.setIcecastStatus("Starting...", "pending");
-		try {
-			await this.ensureAudioContextResumed();
-			this.icecastPublisher.setAudioContext(this.audioContext);
-			const config = this.readIcecastConfigFromForm();
-			await this.icecastPublisher.start(config);
-			this.icecastLive = true;
-		} catch (error) {
-			console.error("Failed to start Icecast publisher", error);
-			this.icecastLive = false;
-			this.setIcecastStatus(error?.message || "Unable to start.", "error");
-		} finally {
-			this.icecastBusy = false;
-			this.updateIcecastUI();
-			this.updateReadinessSummary();
-		}
 	}
 
 	buildLayout() {
@@ -1674,102 +1509,7 @@ class PodcastStudioApp {
 			this.updateDiskRecordingUI();
 		}
 
-		const icecastSettings = readIcecastSettings();
-		const icecastRow = createElement("div", "iso-config-row iso-config-row--icecast");
-		icecastRow.append(createElement("div", "iso-config-row__label", { text: "Icecast" }));
-		const icecastActions = createElement("div", "iso-config-row__actions");
-		this.icecastButton = createElement("button", "iso-config-row__button", {
-			type: "button",
-			text: "Start live",
-			title: "Publish the mixed studio audio to an Icecast-compatible source endpoint."
-		});
-		this.icecastButton.addEventListener("click", () => this.handleIcecastToggle());
-		this.icecastSettingsButton = createElement("button", "iso-config-row__button iso-config-row__button--secondary", {
-			type: "button",
-			text: "Settings",
-			title: "Show Icecast publishing settings.",
-			"aria-expanded": "false"
-		});
-		this.icecastSettingsButton.addEventListener("click", () => this.toggleIcecastSettings());
-		this.icecastStatusNode = createElement("span", "iso-config-row__status", { text: "Idle" });
-		this.icecastStatusNode.dataset.state = "idle";
-		icecastActions.append(this.icecastButton, this.icecastSettingsButton, this.icecastStatusNode);
-		icecastRow.append(icecastActions);
-		isoConfigList.append(icecastRow);
-
-		this.icecastSettingsOpen = false;
-		const icecastPanel = createElement("div", "iso-config-advanced icecast-config");
-		icecastPanel.hidden = true;
-		this.icecastSettingsPanel = icecastPanel;
-		const icecastBody = createElement("div", "iso-config-advanced__body icecast-config__body");
-		const createIcecastField = (labelText, input, hintText = "") => {
-			const label = createElement("label", "icecast-config__field");
-			label.append(createElement("span", "icecast-config__label", { text: labelText }), input);
-			if (hintText) {
-				label.append(createElement("span", "icecast-config__hint", { text: hintText }));
-			}
-			return label;
-		};
-		this.icecastTargetInput = createElement("input", "icecast-config__input", {
-			type: "url",
-			placeholder: "https://radio.example.com/radio/8000/",
-			value: icecastSettings.targetUrl || "",
-			autocomplete: "off",
-			spellcheck: "false",
-			title: "Icecast or AzuraCast source ingest URL, not the public listener URL."
-		});
-		this.icecastUsernameInput = createElement("input", "icecast-config__input", {
-			type: "text",
-			placeholder: "source",
-			value: icecastSettings.username || "source",
-			autocomplete: "username",
-			spellcheck: "false",
-			title: "Icecast source username."
-		});
-		this.icecastPasswordInput = createElement("input", "icecast-config__input", {
-			type: "password",
-			placeholder: "Source password",
-			value: icecastSettings.password || "",
-			autocomplete: "off",
-			autocapitalize: "none",
-			spellcheck: "false",
-			title: "Icecast source password. Stored locally in this browser with the Icecast settings."
-		});
-		this.icecastMimeSelect = createElement("select", "icecast-config__input icecast-config__select", {
-			title: "Audio container sent to Icecast."
-		});
-		ICECAST_MIME_OPTIONS.forEach(option => {
-			this.icecastMimeSelect.append(new Option(option.label, option.value));
-		});
-		this.icecastMimeSelect.value = ICECAST_MIME_OPTIONS.some(option => option.value === icecastSettings.mimeType) ? icecastSettings.mimeType : DEFAULT_ICECAST_MIME_TYPE;
-		this.icecastNameInput = createElement("input", "icecast-config__input", {
-			type: "text",
-			placeholder: "VDO.Ninja Live",
-			value: icecastSettings.name || "",
-			autocomplete: "off",
-			title: "Optional stream name shown by Icecast."
-		});
-		this.icecastGenreInput = createElement("input", "icecast-config__input", {
-			type: "text",
-			placeholder: "Live",
-			value: icecastSettings.genre || "",
-			autocomplete: "off",
-			title: "Optional stream genre shown by Icecast."
-		});
-		const icecastToggles = createElement("div", "icecast-config__toggles");
-		const publicLabel = createElement("label", "icecast-config__toggle");
-		this.icecastPublicInput = createElement("input", "", { type: "checkbox" });
-		this.icecastPublicInput.checked = Boolean(icecastSettings.public);
-		publicLabel.append(this.icecastPublicInput, createElement("span", "", { text: "Public listing" }));
-		icecastToggles.append(publicLabel);
-
-		icecastBody.append(createIcecastField("Source URL", this.icecastTargetInput, "Recommended: allow VDO.Ninja in the Icecast/AzuraCast CORS settings for the best direct publishing path."), createIcecastField("Username", this.icecastUsernameInput), createIcecastField("Password", this.icecastPasswordInput), createIcecastField("Format", this.icecastMimeSelect), createIcecastField("Name", this.icecastNameInput), createIcecastField("Genre", this.icecastGenreInput), icecastToggles);
-		[this.icecastTargetInput, this.icecastUsernameInput, this.icecastPasswordInput, this.icecastMimeSelect, this.icecastPublicInput, this.icecastNameInput, this.icecastGenreInput].forEach(node => {
-			node.addEventListener("input", () => this.persistIcecastSettingsFromForm());
-			node.addEventListener("change", () => this.persistIcecastSettingsFromForm());
-		});
-		icecastPanel.append(icecastBody);
-		isoConfigList.append(icecastPanel);
+		this.icecastController.buildControls(isoConfigList);
 
 		// Summary section
 		this.isoSummary = createElement("div", "iso-config-summary");
@@ -3027,9 +2767,7 @@ class PodcastStudioApp {
 		this.updateGuestBackupControls();
 		this.updateReadinessSummary();
 		this.refreshRecordingStatusLive();
-		if (this.icecastPublisher?.isLive()) {
-			this.icecastPublisher.refreshSources();
-		}
+		this.icecastController.refreshSourcesIfLive();
 	}
 
 	createRosterItem(participant) {
@@ -3916,7 +3654,7 @@ class PodcastStudioApp {
 		const diskMeta = readDiskRecordingState();
 		const diskReady = Boolean(STUDIO_DISK_FEATURE_FLAG && diskMeta.enabled && diskMeta.folderName);
 		const guestBackup = this.getGuestBackupSnapshot();
-		const icecastLive = Boolean(this.icecastPublisher?.isLive());
+		const icecastLive = Boolean(this.icecastController?.isLive());
 		if (this.isoSummary) {
 			this.isoSummary.style.display = driveActive || dropboxActive || diskReady || icecastLive ? "" : "none";
 		}
@@ -4420,11 +4158,7 @@ class PodcastStudioApp {
 			this.abortUploadsController.abort();
 			this.abortUploadsController = null;
 		}
-		if (this.icecastPublisher?.isLive()) {
-			this.icecastPublisher.stop({ quiet: true }).catch(error => {
-				console.warn("Failed to stop Icecast publisher during dispose", error);
-			});
-		}
+		this.icecastController?.dispose();
 		if (this.hostMic?.active || this.virtualParticipants.size) {
 			this.disableHostMic().catch(error => {
 				console.warn("Failed to disable host microphone during dispose", error);
