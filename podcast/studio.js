@@ -12,6 +12,7 @@ import { createRecordingSessionId, snapshotHighResClock } from "./recording-sess
 import { runPreflightChecklist } from "./preflight-checklist.js?v=1";
 import { MarkerLog } from "./marker-log.js?v=1";
 import { HostMicController } from "./host-mic-controller.js?v=1";
+import { GuestBackupController } from "./guest-backup-controller.js?v=1";
 
 const STUDIO_ROOT_ID = "podcast-root";
 const ROSTER_REFRESH_MS = 1500;
@@ -21,20 +22,6 @@ const PODCAST_DISK_EVENT = "podcast-disk-state";
 const PODCAST_RECORD_PLAN_EVENT = "podcast-record-plan";
 const PODCAST_RECORD_STATUS_EVENT = "podcast-record-status";
 const UPLOAD_TRACKER_COOLDOWN_MS = 15000;
-const DRIVE_PROGRESS_EVENT = "vdoninja:gdrive-progress";
-const REMOTE_RECORDER_EVENT = "vdoninja:remote-recorder-status";
-const DEFAULT_GUEST_BACKUP_BITRATE = 6000;
-const DRIVE_STATUS_RESET_MS = 8000;
-const DRIVE_REQUEST_ACK_TIMEOUT_MS = 12000;
-const DRIVE_REQUEST_STALE_TIMEOUT_MS = 60000;
-const DRIVE_RECORDER_HEARTBEAT_GRACE_MS = DRIVE_REQUEST_STALE_TIMEOUT_MS + 15000;
-const DRIVE_STATUS_MESSAGES = {
-	idle: "Drive idle",
-	pending: "Drive readying…",
-	uploading: "Drive uploading…",
-	done: "Drive upload complete",
-	error: "Drive upload error"
-};
 const STUDIO_DISK_FEATURE_FLAG = (() => {
 	let enabled = true;
 	if (typeof urlParams !== "undefined" && urlParams) {
@@ -260,12 +247,6 @@ class PodcastStudioApp {
 		this.audioContext = null;
 		this.recording = false;
 		this.rosterItems = new Map();
-		this.rosterDriveButtons = new Map();
-		this.rosterDriveStatuses = new Map();
-		this.driveStatusResetTimers = new Map();
-		this.driveRequestTimers = new Map();
-		this.driveRecorderStates = new Map();
-		this.driveProgressSnapshots = new Map();
 		this.meterValues = new Map();
 		this.outputIndicators = new Map();
 		this.trackRuntimeStats = new Map();
@@ -291,6 +272,12 @@ class PodcastStudioApp {
 			virtualParticipants: this.virtualParticipants,
 			onRosterChange: () => this.refreshRoster(),
 			applyMeterValue: (uuid, value) => this.applyMeterValue(uuid, value)
+		});
+		this.guestBackup = new GuestBackupController({
+			getParticipants: () => this.getBackupParticipants(),
+			hasDriveAccess: () => Boolean(this.cloud?.hasDriveAccess()),
+			onReadinessChange: () => this.updateReadinessSummary(),
+			onRecordingStatusChange: () => this.refreshRecordingStatusLive()
 		});
 		this.cloudBusy = {
 			drive: false,
@@ -358,8 +345,6 @@ class PodcastStudioApp {
 		this.summaryWarningNode = null;
 		this.recordingSummary = null;
 		this.destinationLights = { download: null, drive: null, dropbox: null, disk: null };
-		this.guestBackupRow = null;
-		this.guestBackupHint = null;
 		this.isoSummary = null;
 		this.captureModeSelect = null;
 		this.recordingStatusNode = null;
@@ -369,11 +354,6 @@ class PodcastStudioApp {
 		this.recordTransitioning = false;
 		this.recordingPlan = null;
 		this.recordingSessionId = null;
-		this.boundDriveProgressHandler = null;
-		this.boundRemoteRecorderHandler = null;
-		this.guestBackupBusy = false;
-		this.guestBackupButton = null;
-		this.guestBackupStatusNode = null;
 		this.currentRecordingMode = readCaptureMode();
 		this.icecastController = null;
 	}
@@ -417,10 +397,6 @@ class PodcastStudioApp {
 		}
 		this.cloudStateListener = () => this.updateReadinessSummary();
 		window.addEventListener(PODCAST_CLOUD_EVENT, this.cloudStateListener);
-		this.boundDriveProgressHandler = event => this.handleDriveProgressEvent(event);
-		window.addEventListener(DRIVE_PROGRESS_EVENT, this.boundDriveProgressHandler);
-		this.boundRemoteRecorderHandler = event => this.handleRemoteRecorderStatusEvent(event);
-		window.addEventListener(REMOTE_RECORDER_EVENT, this.boundRemoteRecorderHandler);
 		this.updateRoomIndicator();
 		this.updateCloudFooter();
 		this.attachRecorderEvents();
@@ -729,7 +705,7 @@ class PodcastStudioApp {
 		if (this.dropboxTokenInput) {
 			this.dropboxTokenInput.disabled = Boolean(this.cloudBusy.dropbox) || this.recording;
 		}
-		this.updateAllDriveActions();
+		this.guestBackup.updateAllActions();
 	}
 
 	ensureDropboxTokenFallbackVisible({ focus = false, select = false } = {}) {
@@ -1200,21 +1176,7 @@ class PodcastStudioApp {
 		isoConfigCard.append(createElement("h2", "session-tool__title", { text: "💾 Recording settings" }));
 		const isoConfigList = createElement("div", "iso-config-list");
 
-		this.guestBackupRow = createElement("div", "iso-config-row");
-		this.guestBackupRow.append(createElement("div", "iso-config-row__label", { text: "Guest backup" }));
-		const guestBackupActions = createElement("div", "iso-config-row__actions");
-		this.guestBackupButton = createElement("button", "iso-config-row__button iso-config-row__button--backup", {
-			type: "button",
-			text: "Enable guest backup",
-			title: "Ask every connected guest to self-record directly to your linked Google Drive."
-		});
-		this.guestBackupButton.addEventListener("click", () => this.handleGuestBackupToggle());
-		this.guestBackupStatusNode = createElement("span", "iso-config-row__status", { text: "No guests connected" });
-		guestBackupActions.append(this.guestBackupButton, this.guestBackupStatusNode);
-		this.guestBackupRow.append(guestBackupActions);
-		this.guestBackupHint = null;
-		this.guestBackupRow.style.display = "none";
-		isoConfigList.append(this.guestBackupRow);
+		isoConfigList.append(this.guestBackup.buildRow());
 
 		// Google Drive row
 		const driveRow = createElement("div", "iso-config-row");
@@ -1543,57 +1505,6 @@ class PodcastStudioApp {
 		return collectParticipants(this.session).filter(participant => participant?.uuid);
 	}
 
-	getGuestBackupParticipantState(uuid) {
-		const legacyButton = this.findLegacyDriveButton(uuid);
-		const pressed = Boolean(legacyButton?.classList?.contains("pressed"));
-		const snapshot = this.driveProgressSnapshots.get(uuid);
-		const heartbeat = this.isDriveRecorderHeartbeatActive(uuid);
-		const status = this.rosterDriveStatuses.get(uuid)?.dataset?.state || "idle";
-		const requested = pressed || heartbeat || Boolean(snapshot) || this.driveRequestTimers.has(uuid) || status === "pending" || status === "uploading";
-		const confirmed = heartbeat || Boolean(snapshot);
-		return {
-			uuid,
-			pressed,
-			snapshot,
-			heartbeat,
-			status,
-			requested,
-			confirmed,
-			error: status === "error"
-		};
-	}
-
-	getGuestBackupSnapshot() {
-		const participants = this.getBackupParticipants().map(participant => ({
-			participant,
-			...this.getGuestBackupParticipantState(participant.uuid)
-		}));
-		const total = participants.length;
-		const requested = participants.filter(entry => entry.requested).length;
-		const confirmed = participants.filter(entry => entry.confirmed).length;
-		const errors = participants.filter(entry => entry.error).length;
-		return {
-			participants,
-			total,
-			requested,
-			confirmed,
-			pending: Math.max(requested - confirmed, 0),
-			errors,
-			linked: Boolean(this.cloud?.hasDriveAccess())
-		};
-	}
-
-	getGuestBackupCompactLabel() {
-		const snapshot = this.getGuestBackupSnapshot();
-		if (!snapshot.total) {
-			return "No guests";
-		}
-		if (!snapshot.requested) {
-			return "No live backup";
-		}
-		return `Guest backup ${snapshot.confirmed}/${snapshot.total}`;
-	}
-
 	describeCaptureMode(mode = this.currentRecordingMode) {
 		return mode === "video" ? "Audio + Video ISO" : "Audio ISO";
 	}
@@ -1651,7 +1562,7 @@ class PodcastStudioApp {
 		}
 		const elapsed = this.formatDuration(Math.max(0, (Date.now() - this.recordStartedAt) / 1000));
 		const trackCount = this.countEstimatedRecordingTracks();
-		const backupLabel = this.getGuestBackupCompactLabel();
+		const backupLabel = this.guestBackup.getCompactLabel();
 		this.recordingStatusNode.textContent = `${elapsed} | ${trackCount} track${trackCount === 1 ? "" : "s"} | ${backupLabel}`;
 		this.recordingStatusNode.dataset.state = "active";
 	}
@@ -1669,59 +1580,6 @@ class PodcastStudioApp {
 		}
 	}
 
-	updateGuestBackupControls() {
-		if (!this.guestBackupButton || !this.guestBackupStatusNode) {
-			return;
-		}
-		const snapshot = this.getGuestBackupSnapshot();
-		if (this.guestBackupRow) {
-			const visible = snapshot.total > 0;
-			this.guestBackupRow.style.display = visible ? "" : "none";
-			if (this.guestBackupHint) this.guestBackupHint.style.display = visible ? "" : "none";
-		}
-		const linked = snapshot.linked;
-		const hasGuests = snapshot.total > 0;
-		const hasRequested = snapshot.requested > 0;
-		const allRequested = hasGuests && snapshot.requested === snapshot.total;
-		const hasPartial = linked && snapshot.requested > 0 && snapshot.requested < snapshot.total;
-		this.guestBackupButton.disabled = this.guestBackupBusy || !hasGuests || (!linked && !hasRequested);
-		this.guestBackupButton.dataset.state = allRequested ? "enabled" : "idle";
-		if (!hasGuests) {
-			this.guestBackupButton.textContent = "Enable guest backup";
-			this.guestBackupButton.title = "A guest must join before backup can be enabled.";
-			this.guestBackupStatusNode.textContent = "No guests connected";
-			this.guestBackupStatusNode.dataset.state = "idle";
-			return;
-		}
-		if (!linked && !hasRequested) {
-			this.guestBackupButton.textContent = "Enable guest backup";
-			this.guestBackupButton.title = "Link Google Drive first to enable guest backup.";
-			this.guestBackupStatusNode.textContent = "Link Google Drive first";
-			this.guestBackupStatusNode.dataset.state = "error";
-			return;
-		}
-		if (allRequested || (!linked && hasRequested)) {
-			this.guestBackupButton.textContent = "Disable guest backup";
-			this.guestBackupButton.title = "Stop guest-side backup recording for all connected guests.";
-		} else if (hasPartial) {
-			this.guestBackupButton.textContent = "Enable missing backups";
-			this.guestBackupButton.title = "Enable backup recording for guests not yet confirmed.";
-		} else {
-			this.guestBackupButton.textContent = "Enable guest backup";
-			this.guestBackupButton.title = "Ask every connected guest to self-record directly to your linked Google Drive.";
-		}
-		if (!snapshot.requested) {
-			this.guestBackupStatusNode.textContent = `Ready for ${snapshot.total} guest${snapshot.total === 1 ? "" : "s"}`;
-			this.guestBackupStatusNode.dataset.state = "idle";
-		} else if (snapshot.confirmed === snapshot.total) {
-			this.guestBackupStatusNode.textContent = `${snapshot.confirmed}/${snapshot.total} confirmed`;
-			this.guestBackupStatusNode.dataset.state = "ready";
-		} else {
-			this.guestBackupStatusNode.textContent = `${snapshot.confirmed}/${snapshot.total} confirmed`;
-			this.guestBackupStatusNode.dataset.state = snapshot.errors ? "error" : "pending";
-		}
-	}
-
 	updateRecordingButtons() {
 		if (this.recordButton) {
 			this.recordButton.classList.toggle("recording", this.recording);
@@ -1732,7 +1590,7 @@ class PodcastStudioApp {
 		if (this.captureModeSelect) {
 			this.captureModeSelect.disabled = this.recording;
 		}
-		this.updateGuestBackupControls();
+		this.guestBackup.updateControls();
 	}
 
 	attachRecorderEvents() {
@@ -2559,13 +2417,13 @@ class PodcastStudioApp {
 				}
 				this.rosterItems.delete(uuid);
 				this.meterValues.delete(uuid);
-				this.teardownDriveControl(uuid);
+				this.guestBackup.teardownRosterControl(uuid);
 				if (this.remoteOverlay && this.remoteOverlay.dataset.activeUuid === uuid) {
 					this.closeRemoteOverlay();
 				}
 			}
 		});
-		this.updateGuestBackupControls();
+		this.guestBackup.updateControls();
 		this.updateReadinessSummary();
 		this.refreshRecordingStatusLive();
 		this.icecastController.refreshSourcesIfLive();
@@ -2617,7 +2475,7 @@ class PodcastStudioApp {
 			actionRow.append(controlButton);
 			hasActions = true;
 		}
-		const driveControls = this.createDriveControl(participant);
+		const driveControls = this.guestBackup.createRosterControl(participant);
 		if (driveControls) {
 			actionRow.append(driveControls.button);
 			hasActions = true;
@@ -2652,7 +2510,7 @@ class PodcastStudioApp {
 			descriptor.style.display = descriptorText ? "" : "none";
 		}
 		this.applyMeterValue(participant.uuid, participant.audioLevel || 0);
-		this.updateDriveActionAvailability(participant.uuid);
+		this.guestBackup.updateActionAvailability(participant.uuid);
 
 		// Update video thumbnail if available
 		const videoThumb = item.querySelector(".roster-item__video-thumb");
@@ -2671,429 +2529,6 @@ class PodcastStudioApp {
 				videoThumb.dataset.noVideo = "true";
 			}
 		}
-	}
-
-	createDriveControl(participant) {
-		if (!participant || participant.role === "host-mic" || !participant.uuid) {
-			return null;
-		}
-		if (typeof window === "undefined" || typeof window.requestGoogleDriveRecord !== "function") {
-			return null;
-		}
-		const button = createElement("button", "roster-action-button roster-action-button--drive", {
-			type: "button",
-			text: "Guest → Drive",
-			title: "Record guest to Google Drive (video + audio)"
-		});
-		button.dataset.uuid = participant.uuid;
-		button.addEventListener("click", () => this.handleDriveRecordToggle(participant.uuid));
-
-		const status = createElement("div", "roster-drive-status", { text: DRIVE_STATUS_MESSAGES.idle });
-		status.dataset.state = "idle";
-		status.dataset.uuid = participant.uuid;
-
-		this.rosterDriveButtons.set(participant.uuid, button);
-		this.rosterDriveStatuses.set(participant.uuid, status);
-		this.updateDriveActionAvailability(participant.uuid);
-		this.applyDriveSnapshot(participant.uuid);
-
-		return { button, status };
-	}
-
-	teardownDriveControl(uuid) {
-		if (!uuid) {
-			return;
-		}
-		this.clearDriveRequestTimers(uuid);
-		if (this.driveStatusResetTimers.has(uuid)) {
-			clearTimeout(this.driveStatusResetTimers.get(uuid));
-			this.driveStatusResetTimers.delete(uuid);
-		}
-		this.rosterDriveButtons.delete(uuid);
-		this.rosterDriveStatuses.delete(uuid);
-		this.driveRecorderStates.delete(uuid);
-		this.driveProgressSnapshots.delete(uuid);
-	}
-
-	clearDriveRequestTimers(uuid) {
-		if (!uuid) {
-			return;
-		}
-		const timers = this.driveRequestTimers.get(uuid);
-		if (!timers) {
-			return;
-		}
-		if (timers.ack) {
-			clearTimeout(timers.ack);
-		}
-		if (timers.stale) {
-			clearTimeout(timers.stale);
-		}
-		this.driveRequestTimers.delete(uuid);
-	}
-
-	isDriveRecorderHeartbeatActive(uuid) {
-		const state = this.driveRecorderStates.get(uuid);
-		if (!state) {
-			return false;
-		}
-		if (!(state.code >= 0 || state.code === -5 || state.code === -2)) {
-			return false;
-		}
-		if (!state.at) {
-			return true;
-		}
-		return Date.now() - state.at <= DRIVE_RECORDER_HEARTBEAT_GRACE_MS;
-	}
-
-	scheduleDriveRequestWatchdog(uuid) {
-		if (!uuid) {
-			return;
-		}
-		this.clearDriveRequestTimers(uuid);
-		const timers = {
-			ack: null,
-			stale: null
-		};
-		timers.ack = setTimeout(() => {
-			const latestSnapshot = this.driveProgressSnapshots.get(uuid);
-			if (latestSnapshot) {
-				this.setRosterDriveStatusFromSnapshot(uuid, latestSnapshot);
-				return;
-			}
-			const legacyButton = this.findLegacyDriveButton(uuid);
-			const pressed = Boolean(legacyButton?.classList?.contains("pressed"));
-			this.setRosterDriveStatus(uuid, "pending", pressed ? "Drive requested. Waiting for guest recorder to start…" : "Drive request sent. Waiting for guest to confirm recording permission…");
-			const runStaleCheck = () => {
-				const staleSnapshot = this.driveProgressSnapshots.get(uuid);
-				if (staleSnapshot) {
-					this.setRosterDriveStatusFromSnapshot(uuid, staleSnapshot);
-					return;
-				}
-				const stillPressed = Boolean(this.findLegacyDriveButton(uuid)?.classList?.contains("pressed"));
-				if (this.isDriveRecorderHeartbeatActive(uuid)) {
-					this.setRosterDriveStatus(uuid, "pending", "Guest recorder is active. Waiting for Drive upload stats…");
-					timers.stale = setTimeout(runStaleCheck, DRIVE_REQUEST_STALE_TIMEOUT_MS);
-					this.driveRequestTimers.set(uuid, timers);
-					return;
-				}
-				if (!stillPressed) {
-					this.setRosterDriveStatus(uuid, "error", "Guest did not confirm Drive recording.");
-					this.updateDriveActionAvailability(uuid);
-				} else {
-					this.setRosterDriveStatus(uuid, "error", "Drive upload never started. Ask guest to allow recording and retry.");
-					this.updateDriveActionAvailability(uuid);
-				}
-				this.clearDriveRequestTimers(uuid);
-			};
-			timers.stale = setTimeout(runStaleCheck, DRIVE_REQUEST_STALE_TIMEOUT_MS);
-			this.driveRequestTimers.set(uuid, timers);
-		}, DRIVE_REQUEST_ACK_TIMEOUT_MS);
-		this.driveRequestTimers.set(uuid, timers);
-	}
-
-	reconcileDriveRequestOutcome(uuid) {
-		if (!uuid) {
-			return;
-		}
-		const latestSnapshot = this.driveProgressSnapshots.get(uuid);
-		if (latestSnapshot) {
-			this.setRosterDriveStatusFromSnapshot(uuid, latestSnapshot);
-			return;
-		}
-		const legacyButton = this.findLegacyDriveButton(uuid);
-		const pressed = Boolean(legacyButton?.classList?.contains("pressed"));
-		if (pressed) {
-			this.setRosterDriveStatus(uuid, "pending", "Drive request sent. Waiting for upload telemetry…");
-			return;
-		}
-		this.setRosterDriveStatus(uuid, "error", "Drive upload not started. Retry and have the guest accept the recording prompt.");
-	}
-
-	findLegacyDriveButton(uuid) {
-		if (!uuid || typeof document === "undefined") {
-			return null;
-		}
-		return document.querySelector('[data-action-type="recorder-google-drive-remote"][data--u-u-i-d="' + uuid + '"]');
-	}
-
-	canTriggerDriveUpload() {
-		if (typeof window === "undefined" || typeof window.requestGoogleDriveRecord !== "function") {
-			return false;
-		}
-		return Boolean(this.cloud?.hasDriveAccess());
-	}
-
-	async handleGuestBackupToggle() {
-		const snapshot = this.getGuestBackupSnapshot();
-		if (!snapshot.total) {
-			this.updateGuestBackupControls();
-			this.updateReadinessSummary();
-			return;
-		}
-		if (!this.canTriggerDriveUpload()) {
-			if (this.guestBackupStatusNode) {
-				this.guestBackupStatusNode.textContent = "Link Google Drive first";
-				this.guestBackupStatusNode.dataset.state = "error";
-			}
-			this.updateReadinessSummary();
-			return;
-		}
-		const stopTargets = snapshot.participants.filter(entry => entry.requested).map(entry => entry.uuid);
-		const armTargets = snapshot.participants.filter(entry => !entry.requested).map(entry => entry.uuid);
-		const stopping = snapshot.requested === snapshot.total;
-		const targets = stopping ? stopTargets : armTargets;
-		if (!targets.length) {
-			this.updateGuestBackupControls();
-			this.updateReadinessSummary();
-			return;
-		}
-		this.guestBackupBusy = true;
-		this.updateGuestBackupControls();
-		try {
-			if (stopping) {
-				for (const uuid of targets) {
-					// Reuse the existing per-guest stop path so the legacy UI stays in sync.
-					await this.handleDriveRecordToggle(uuid);
-				}
-			} else {
-				for (const uuid of targets) {
-					await this.handleDriveRecordToggle(uuid, { bitrate: DEFAULT_GUEST_BACKUP_BITRATE });
-				}
-			}
-		} finally {
-			this.guestBackupBusy = false;
-			this.updateGuestBackupControls();
-			this.updateReadinessSummary();
-			this.refreshRecordingStatusLive();
-		}
-	}
-
-	async handleDriveRecordToggle(uuid, { bitrate = null } = {}) {
-		if (!uuid) {
-			return;
-		}
-		const button = this.rosterDriveButtons.get(uuid);
-		if (!button) {
-			return;
-		}
-		if (typeof window === "undefined" || typeof window.requestGoogleDriveRecord !== "function") {
-			this.setRosterDriveStatus(uuid, "error", "Drive controls unavailable in this build.");
-			return;
-		}
-		const legacyButton = this.findLegacyDriveButton(uuid);
-		if (!legacyButton) {
-			this.setRosterDriveStatus(uuid, "pending", "Guest controls preparing…");
-			this.updateDriveActionAvailability(uuid);
-			return;
-		}
-		const isActive = legacyButton.classList?.contains("pressed");
-		if (!isActive && !this.canTriggerDriveUpload()) {
-			this.setRosterDriveStatus(uuid, "error", "Link Google Drive above to enable uploads.");
-			this.updateDriveActionAvailability(uuid);
-			return;
-		}
-		button.dataset.pending = "true";
-		button.disabled = true;
-		try {
-			if (isActive) {
-				this.clearDriveRequestTimers(uuid);
-				this.driveRecorderStates.delete(uuid);
-				await window.requestGoogleDriveRecord(legacyButton, false);
-				this.setRosterDriveStatus(uuid, "idle", DRIVE_STATUS_MESSAGES.idle);
-			} else {
-				// Drop any stale snapshot from a prior upload so a new request must
-				// wait for fresh telemetry before reconciling success/failure.
-				this.driveProgressSnapshots.delete(uuid);
-				this.driveRecorderStates.delete(uuid);
-				this.setRosterDriveStatus(uuid, "pending", "Requesting Drive upload…");
-				await window.requestGoogleDriveRecord(legacyButton, true, bitrate);
-				const started = Boolean(legacyButton.classList?.contains("pressed")) || Boolean(this.driveProgressSnapshots.get(uuid)) || this.isDriveRecorderHeartbeatActive(uuid);
-				if (started) {
-					this.scheduleDriveRequestWatchdog(uuid);
-					this.reconcileDriveRequestOutcome(uuid);
-				} else {
-					this.setRosterDriveStatus(uuid, "idle", DRIVE_STATUS_MESSAGES.idle);
-				}
-			}
-		} catch (error) {
-			this.clearDriveRequestTimers(uuid);
-			const message = error?.message || "Drive request cancelled";
-			this.setRosterDriveStatus(uuid, "error", message);
-		} finally {
-			button.dataset.pending = "false";
-			this.updateDriveActionAvailability(uuid);
-			this.updateReadinessSummary();
-			this.refreshRecordingStatusLive();
-		}
-	}
-
-	updateDriveActionAvailability(uuid) {
-		const button = this.rosterDriveButtons.get(uuid);
-		if (!button) {
-			return;
-		}
-		const hasRequestApi = typeof window !== "undefined" && typeof window.requestGoogleDriveRecord === "function";
-		const legacyButton = this.findLegacyDriveButton(uuid);
-		const hasLegacyControl = Boolean(legacyButton);
-		const isActive = Boolean(legacyButton?.classList?.contains("pressed"));
-		const pending = button.dataset.pending === "true";
-
-		let disabled = pending || !hasRequestApi;
-		let title = "";
-
-		if (!hasRequestApi) {
-			title = "Drive controls are not available in this build.";
-		} else if (!hasLegacyControl) {
-			title = "Guest controls are still initialising.";
-			disabled = true;
-		} else if (isActive) {
-			title = "Stop this guest’s Drive upload.";
-			disabled = pending;
-		} else if (!this.canTriggerDriveUpload()) {
-			title = "Link Google Drive above to enable uploads.";
-			disabled = true;
-		} else {
-			title = "Ask this guest to upload to Drive.";
-			disabled = pending;
-		}
-
-		button.disabled = disabled;
-		button.textContent = isActive ? "Stop Guest → Drive" : "Guest → Drive";
-		button.dataset.state = isActive ? "active" : "idle";
-		if (title) {
-			button.title = title;
-		}
-	}
-
-	updateAllDriveActions() {
-		this.rosterDriveButtons.forEach((_, uuid) => this.updateDriveActionAvailability(uuid));
-	}
-
-	setRosterDriveStatus(uuid, state = "idle", text) {
-		const node = this.rosterDriveStatuses.get(uuid);
-		if (!node) {
-			return;
-		}
-		if (this.driveStatusResetTimers.has(uuid)) {
-			clearTimeout(this.driveStatusResetTimers.get(uuid));
-			this.driveStatusResetTimers.delete(uuid);
-		}
-		const label = text || DRIVE_STATUS_MESSAGES[state] || DRIVE_STATUS_MESSAGES.idle;
-		node.dataset.state = state;
-		node.textContent = label;
-		if (state === "done" || state === "idle" || state === "error") {
-			this.clearDriveRequestTimers(uuid);
-		}
-		if (state === "done") {
-			const timer = setTimeout(() => {
-				this.setRosterDriveStatus(uuid, "idle", DRIVE_STATUS_MESSAGES.idle);
-				this.driveStatusResetTimers.delete(uuid);
-			}, DRIVE_STATUS_RESET_MS);
-			this.driveStatusResetTimers.set(uuid, timer);
-		}
-		this.updateGuestBackupControls();
-		this.updateReadinessSummary();
-		this.refreshRecordingStatusLive();
-	}
-
-	applyDriveSnapshot(uuid) {
-		const snapshot = this.driveProgressSnapshots.get(uuid);
-		if (!snapshot) {
-			return;
-		}
-		this.setRosterDriveStatusFromSnapshot(uuid, snapshot);
-	}
-
-	setRosterDriveStatusFromSnapshot(uuid, gdrive) {
-		if (!gdrive) {
-			this.setRosterDriveStatus(uuid, "idle", DRIVE_STATUS_MESSAGES.idle);
-			return;
-		}
-		this.clearDriveRequestTimers(uuid);
-		if (gdrive.state === 2) {
-			this.setRosterDriveStatus(uuid, "done", DRIVE_STATUS_MESSAGES.done);
-			return;
-		}
-		if (typeof gdrive.rec === "number" && gdrive.rec > 0) {
-			const percent = Math.min(100, Math.round((gdrive.up / Math.max(1, gdrive.rec)) * 100));
-			this.setRosterDriveStatus(uuid, "uploading", `Drive upload ${percent}%`);
-		} else {
-			this.setRosterDriveStatus(uuid, "pending", DRIVE_STATUS_MESSAGES.pending);
-		}
-	}
-
-	handleDriveProgressEvent(event) {
-		const detail = event?.detail;
-		if (!detail || !detail.UUID) {
-			return;
-		}
-		const { UUID: uuid, gdrive } = detail;
-		this.driveProgressSnapshots.set(uuid, gdrive || null);
-		if (!this.rosterDriveStatuses.has(uuid)) {
-			return;
-		}
-		this.setRosterDriveStatusFromSnapshot(uuid, gdrive || null);
-		this.updateDriveActionAvailability(uuid);
-		this.updateReadinessSummary();
-		this.refreshRecordingStatusLive();
-	}
-
-	handleRemoteRecorderStatusEvent(event) {
-		const detail = event?.detail;
-		if (!detail || !detail.UUID) {
-			return;
-		}
-		const { UUID: uuid, recorder, screen } = detail;
-		if (screen || !this.rosterDriveStatuses.has(uuid)) {
-			return;
-		}
-		const legacyDriveButton = this.findLegacyDriveButton(uuid);
-		const hasWatchdog = this.driveRequestTimers.has(uuid);
-		const drivePressed = Boolean(legacyDriveButton?.classList?.contains("pressed"));
-		const currentState = this.rosterDriveStatuses.get(uuid)?.dataset?.state || "idle";
-		const driveStateActive = currentState === "pending" || currentState === "uploading";
-		if (!hasWatchdog && !drivePressed && !driveStateActive) {
-			// Ignore generic remote-recorder updates unless Drive was actually requested/active.
-			return;
-		}
-		const code = parseInt(recorder, 10);
-		if (!Number.isFinite(code)) {
-			return;
-		}
-		this.driveRecorderStates.set(uuid, { code, at: Date.now() });
-		if (code >= 0) {
-			if (!this.driveProgressSnapshots.get(uuid)) {
-				const minutes = Math.floor(code / 60);
-				const seconds = Math.max(0, code - minutes * 60)
-					.toString()
-					.padStart(2, "0");
-				this.setRosterDriveStatus(uuid, "pending", `Guest recording ${minutes}m ${seconds}s… waiting for Drive stats`);
-			}
-			this.updateDriveActionAvailability(uuid);
-			return;
-		}
-		if (code === -5) {
-			this.setRosterDriveStatus(uuid, "pending", "Guest recorder started with experimental browser support.");
-		} else if (code === -4) {
-			this.setRosterDriveStatus(uuid, "error", "Guest recording stopped unexpectedly.");
-		} else if (code === -3) {
-			this.setRosterDriveStatus(uuid, "error", "Guest browser cannot record/upload to Drive.");
-		} else if (code === -2) {
-			this.setRosterDriveStatus(uuid, "pending", "Guest recorder stopping…");
-		} else if (code === -1) {
-			const snapshot = this.driveProgressSnapshots.get(uuid);
-			if (snapshot) {
-				this.setRosterDriveStatusFromSnapshot(uuid, snapshot);
-			} else if (hasWatchdog || drivePressed || driveStateActive) {
-				this.setRosterDriveStatus(uuid, "error", "Guest recorder stopped before Drive upload telemetry started.");
-			} else {
-				this.setRosterDriveStatus(uuid, "idle", DRIVE_STATUS_MESSAGES.idle);
-			}
-		}
-		this.updateDriveActionAvailability(uuid);
-		this.updateReadinessSummary();
-		this.refreshRecordingStatusLive();
 	}
 
 	ensureRemoteOverlay() {
@@ -3454,7 +2889,7 @@ class PodcastStudioApp {
 		const dropboxActive = Boolean(this.cloud?.hasDropboxAccess());
 		const diskMeta = readDiskRecordingState();
 		const diskReady = Boolean(STUDIO_DISK_FEATURE_FLAG && diskMeta.enabled && diskMeta.folderName);
-		const guestBackup = this.getGuestBackupSnapshot();
+		const guestBackup = this.guestBackup.getSnapshot();
 		const icecastLive = Boolean(this.icecastController?.isLive());
 		if (this.isoSummary) {
 			this.isoSummary.style.display = driveActive || dropboxActive || diskReady || icecastLive ? "" : "none";
@@ -3512,7 +2947,7 @@ class PodcastStudioApp {
 			this.cloudSummaryNode.textContent = afterSessionTargets.length ? `Outputs: ${afterSessionTargets.join(" • ")}` : "After-session save: Browser buffer only";
 			this.cloudSummaryNode.dataset.state = afterSessionTargets.length ? "ready" : "pending";
 		}
-		this.updateGuestBackupControls();
+		this.guestBackup.updateControls();
 	}
 
 	updateDestinationLights(driveActive, dropboxActive, diskReady, diskMeta, guestBackup) {
@@ -3927,9 +3362,7 @@ class PodcastStudioApp {
 	}
 
 	dispose() {
-		this.driveRequestTimers.forEach((_timers, uuid) => {
-			this.clearDriveRequestTimers(uuid);
-		});
+		this.guestBackup.dispose();
 		this.stopRecordingStatusTimer();
 		if (this.rosterTimer) {
 			clearInterval(this.rosterTimer);
@@ -3942,14 +3375,6 @@ class PodcastStudioApp {
 		if (this.cloudStateListener) {
 			window.removeEventListener(PODCAST_CLOUD_EVENT, this.cloudStateListener);
 			this.cloudStateListener = null;
-		}
-		if (this.boundDriveProgressHandler) {
-			window.removeEventListener(DRIVE_PROGRESS_EVENT, this.boundDriveProgressHandler);
-			this.boundDriveProgressHandler = null;
-		}
-		if (this.boundRemoteRecorderHandler) {
-			window.removeEventListener(REMOTE_RECORDER_EVENT, this.boundRemoteRecorderHandler);
-			this.boundRemoteRecorderHandler = null;
 		}
 		if (this.levelOff) {
 			this.levelOff();
@@ -4040,11 +3465,6 @@ class PodcastStudioApp {
 		}
 		this.remoteOverlay = null;
 		this.remoteOverlayContent = null;
-		this.rosterDriveButtons.clear();
-		this.rosterDriveStatuses.clear();
-		this.driveRecorderStates.clear();
-		this.driveStatusResetTimers.forEach(timer => clearTimeout(timer));
-		this.driveStatusResetTimers.clear();
 	}
 }
 
