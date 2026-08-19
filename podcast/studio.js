@@ -1,4 +1,4 @@
-import { waitForLegacySession, levelBus, LEVEL_EVENT, MultiTrackRecorder, CloudUploadCoordinator, bridgeLegacyMeters, monitorTrackLevel } from "../core/index.js";
+import { waitForLegacySession, levelBus, LEVEL_EVENT, MultiTrackRecorder, CloudUploadCoordinator, bridgeLegacyMeters } from "../core/index.js";
 import { readDiskRecordingState, isDiskRecordingEnabled, setDiskRecordingEnabled, verifyStoredDiskRecordingDirectory, chooseDiskRecordingDirectory, readDiskDirectoryHandle } from "./disk-recording-store.js?v=1";
 import { readCloudLinkStatus, isCloudLinkFresh, markCloudLinked, markCloudUnlinked } from "./cloud-link-store.js?v=1";
 import { readCaptureMode, writeCaptureMode } from "./capture-mode-store.js?v=1";
@@ -11,6 +11,7 @@ import { formatRelativeTime } from "./time-format.js?v=1";
 import { createRecordingSessionId, snapshotHighResClock } from "./recording-session-utils.js?v=1";
 import { runPreflightChecklist } from "./preflight-checklist.js?v=1";
 import { MarkerLog } from "./marker-log.js?v=1";
+import { HostMicController } from "./host-mic-controller.js?v=1";
 
 const STUDIO_ROOT_ID = "podcast-root";
 const ROSTER_REFRESH_MS = 1500;
@@ -282,14 +283,15 @@ class PodcastStudioApp {
 		this.stopMeterBridge = null;
 		this.roomName = this.roomHint || "";
 		this.virtualParticipants = new Map();
-		this.hostMic = null;
-		this.hostMicMeter = null;
-		this.hostMicButton = null;
-		this.hostMicStatusNode = null;
-		this.hostMicErrorNode = null;
-		this.hostMicBusy = false;
-		this.hostMicMuted = false;
-		this.hostMuteButton = null;
+		this.hostMicController = new HostMicController({
+			isRecording: () => this.recording,
+			getAudioContext: () => this.audioContext,
+			ensureAudioContextResumed: () => this.ensureAudioContextResumed(),
+			getSessionLabel: () => this.session?.label,
+			virtualParticipants: this.virtualParticipants,
+			onRosterChange: () => this.refreshRoster(),
+			applyMeterValue: (uuid, value) => this.applyMeterValue(uuid, value)
+		});
 		this.cloudBusy = {
 			drive: false,
 			dropbox: false
@@ -684,196 +686,6 @@ class PodcastStudioApp {
 		}
 	}
 
-	setHostMicError(message) {
-		if (this.hostMicErrorNode) {
-			this.hostMicErrorNode.textContent = message || "";
-		}
-	}
-
-	updateHostMicUI() {
-		if (this.hostMicButton) {
-			if (this.hostMicBusy || this.recording) {
-				this.hostMicButton.disabled = true;
-				const busyLabel = this.hostMic?.active ? "Disabling…" : "Enabling…";
-				this.hostMicButton.textContent = this.recording ? "Locked" : busyLabel;
-			} else {
-				this.hostMicButton.disabled = false;
-				this.hostMicButton.textContent = this.hostMic?.active ? "Disable" : "Enable";
-			}
-			if (this.hostMic?.active) {
-				this.hostMicButton.classList.add("active");
-			} else {
-				this.hostMicButton.classList.remove("active");
-			}
-		}
-		if (this.hostMicStatusNode) {
-			if (this.hostMic?.active) {
-				this.hostMicStatusNode.textContent = "Live";
-				this.hostMicStatusNode.dataset.state = "active";
-			} else {
-				this.hostMicStatusNode.textContent = "Idle";
-				this.hostMicStatusNode.dataset.state = "idle";
-			}
-		}
-		this.updateHostMuteUI();
-	}
-
-	async handleHostMicToggle() {
-		if (this.recording) {
-			this.setHostMicError("Stop the recording to change the host mic.");
-			return;
-		}
-		if (this.hostMicBusy) {
-			return;
-		}
-		if (this.hostMic?.active) {
-			await this.disableHostMic();
-		} else {
-			await this.enableHostMic();
-		}
-	}
-
-	handleHostMuteToggle() {
-		if (!this.hostMic?.active) {
-			return;
-		}
-		this.hostMicMuted = !this.hostMicMuted;
-		if (this.hostMic.track) {
-			this.hostMic.track.enabled = !this.hostMicMuted;
-		}
-		this.updateHostMuteUI();
-	}
-
-	updateHostMuteUI() {
-		if (this.hostMuteButton) {
-			if (this.hostMic?.active) {
-				this.hostMuteButton.disabled = false;
-				this.hostMuteButton.textContent = this.hostMicMuted ? "🔇 Unmute" : "🔊 Mute";
-				this.hostMuteButton.classList.toggle("muted", this.hostMicMuted);
-			} else {
-				this.hostMuteButton.disabled = true;
-				this.hostMuteButton.textContent = "🔊 Mute";
-				this.hostMuteButton.classList.remove("muted");
-			}
-		}
-	}
-
-	async enableHostMic() {
-		if (this.hostMic?.active) {
-			this.updateHostMicUI();
-			return;
-		}
-		if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) {
-			this.setHostMicError("Browser does not support microphone capture.");
-			return;
-		}
-		this.hostMicBusy = true;
-		this.setHostMicError("");
-		this.updateHostMicUI();
-		try {
-			await this.ensureAudioContextResumed();
-			const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-			const [track] = stream.getAudioTracks();
-			if (!track) {
-				throw new Error("No audio track available.");
-			}
-			const label = this.session?.label ? `${this.session.label} (Host)` : "Host Mic";
-			const participant = {
-				uuid: "host-mic",
-				label,
-				stream,
-				streamID: "host-mic",
-				status: "connected",
-				audioLevel: 0,
-				isLocal: true,
-				kind: "local",
-				role: "host-mic"
-			};
-			track.addEventListener("ended", () => {
-				if (this.hostMic?.track === track) {
-					this.disableHostMic();
-				}
-			});
-			this.hostMic = {
-				active: true,
-				stream,
-				track,
-				uuid: participant.uuid,
-				label: participant.label,
-				streamID: participant.streamID,
-				participant
-			};
-			this.virtualParticipants.set(participant.uuid, participant);
-			if (this.audioContext && track) {
-				try {
-					this.hostMicMeter = await monitorTrackLevel(this.audioContext, track, {
-						uuid: participant.uuid,
-						trackType: "audio",
-						metadata: { label: participant.label, source: "host" }
-					});
-				} catch (error) {
-					console.warn("Failed to attach host mic meter", error);
-				}
-			}
-			this.updateHostMicUI();
-			this.refreshRoster();
-		} catch (error) {
-			console.error("Failed to enable host microphone", error);
-			this.setHostMicError(error?.message || "Unable to access microphone.");
-			if (this.hostMic?.stream) {
-				try {
-					this.hostMic.stream.getTracks().forEach(mediaTrack => mediaTrack.stop());
-				} catch (stopError) {
-					console.warn("Failed to stop host mic stream after error", stopError);
-				}
-			}
-			this.hostMic = null;
-			this.virtualParticipants.delete("host-mic");
-			this.updateHostMicUI();
-		} finally {
-			this.hostMicBusy = false;
-			this.updateHostMicUI();
-		}
-	}
-
-	async disableHostMic() {
-		if (!this.hostMic?.active && !this.virtualParticipants.has("host-mic")) {
-			this.hostMic = null;
-			this.updateHostMicUI();
-			return;
-		}
-		this.hostMicBusy = true;
-		this.updateHostMicUI();
-		try {
-			if (this.hostMicMeter) {
-				try {
-					this.hostMicMeter.disconnect({ stopTrack: false });
-				} catch (error) {
-					console.warn("Failed to disconnect host mic meter", error);
-				}
-				this.hostMicMeter = null;
-			}
-			if (this.hostMic?.stream) {
-				this.hostMic.stream.getTracks().forEach(track => {
-					try {
-						track.stop();
-					} catch (error) {
-						console.warn("Failed to stop host mic track", error);
-					}
-				});
-			}
-		} finally {
-			this.virtualParticipants.delete("host-mic");
-			this.hostMic = null;
-			this.hostMicBusy = false;
-			this.hostMicMuted = false;
-			this.setHostMicError("");
-			this.updateHostMicUI();
-			this.applyMeterValue("host-mic", 0);
-			this.refreshRoster();
-		}
-	}
-
 	setCloudMessage(service, message, variant = "info") {
 		const container = this.cloudLinkMessages?.[service];
 		if (!container) {
@@ -1223,18 +1035,7 @@ class PodcastStudioApp {
 		const rosterColumn = createElement("div", "podcast-roster");
 
 		// Host Input panel (director's mic)
-		const hostPanel = createElement("section", "podcast-panel host-panel");
-		hostPanel.append(createElement("h2", "", { text: "🎙️ Host Input" }));
-		const hostControls = createElement("div", "host-input-content");
-		this.hostMicButton = createElement("button", "host-input-toggle", { type: "button", text: "Enable", title: "Toggle local host microphone capture (optional)." });
-		this.hostMicButton.addEventListener("click", () => this.handleHostMicToggle());
-		this.hostMuteButton = createElement("button", "host-mute-toggle", { type: "button", text: "🔊 Mute", title: "Mute/unmute the host mic track." });
-		this.hostMuteButton.disabled = true;
-		this.hostMuteButton.addEventListener("click", () => this.handleHostMuteToggle());
-		this.hostMicStatusNode = createElement("div", "host-input-status", { text: "Idle" });
-		hostControls.append(this.hostMicButton, this.hostMuteButton, this.hostMicStatusNode);
-		this.hostMicErrorNode = createElement("div", "host-input-error");
-		hostPanel.append(hostControls, this.hostMicErrorNode);
+		const hostPanel = this.hostMicController.buildControls();
 
 		const rosterPanel = createElement("section", "podcast-panel");
 		this.rosterList = createElement("div", "roster-list");
@@ -1659,8 +1460,8 @@ class PodcastStudioApp {
 
 		this.driveStatusNode = document.getElementById("podcast-cloud-drive");
 		this.dropboxStatusNode = document.getElementById("podcast-cloud-dropbox");
-		this.updateHostMicUI();
-		this.setHostMicError("");
+		this.hostMicController.updateUI();
+		this.hostMicController.setError("");
 		this.updateCloudLinkUI();
 		this.updateReadinessSummary();
 		this.setCloudMessage("drive", "");
@@ -1953,7 +1754,7 @@ class PodcastStudioApp {
 			this.updateRecordingButtons();
 			this.markerButton.disabled = false;
 			this.showOutputsMessage("Recording… tracks will appear as media arrives.");
-			this.updateHostMicUI();
+			this.hostMicController.updateUI();
 			this.setUploadProgressPending(true);
 			if (this.recordingPlan?.sync) {
 				this.recordingPlan.sync.start = {
@@ -2050,7 +1851,7 @@ class PodcastStudioApp {
 			this.presentRecordings(event.detail?.files);
 			this.outputIndicators.clear();
 			this.trackRuntimeStats.clear();
-			this.updateHostMicUI();
+			this.hostMicController.updateUI();
 			if (this.recordingPlan?.sync) {
 				this.recordingPlan.sync.stop = {
 					wallClock: Date.now(),
@@ -2578,7 +2379,7 @@ class PodcastStudioApp {
 		} catch (error) {
 			console.error("Failed to start recorder", error);
 			this.setStatusMessage("Unable to start recording: " + (error?.message || "unknown error"));
-			this.updateHostMicUI();
+			this.hostMicController.updateUI();
 			this.recordTransitioning = false;
 			this.updateRecordingButtons();
 			this.stopRecordingStatusTimer();
@@ -4159,11 +3960,9 @@ class PodcastStudioApp {
 			this.abortUploadsController = null;
 		}
 		this.icecastController?.dispose();
-		if (this.hostMic?.active || this.virtualParticipants.size) {
-			this.disableHostMic().catch(error => {
-				console.warn("Failed to disable host microphone during dispose", error);
-			});
-		}
+		this.hostMicController.dispose().catch(error => {
+			console.warn("Failed to disable host microphone during dispose", error);
+		});
 		this.restoreRemoteControls();
 		if (this.chatModule) {
 			try {
