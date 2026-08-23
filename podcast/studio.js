@@ -13,9 +13,9 @@ import { runPreflightChecklist } from "./preflight-checklist.js?v=1";
 import { MarkerLog } from "./marker-log.js?v=1";
 import { HostMicController } from "./host-mic-controller.js?v=1";
 import { GuestBackupController } from "./guest-backup-controller.js?v=1";
+import { RosterController } from "./roster-controller.js?v=1";
 
 const STUDIO_ROOT_ID = "podcast-root";
-const ROSTER_REFRESH_MS = 1500;
 const DROPBOX_GUIDE_URL = "/cloud.html#dropbox";
 const PODCAST_CLOUD_EVENT = "podcast-cloud-status";
 const PODCAST_DISK_EVENT = "podcast-disk-state";
@@ -246,15 +246,12 @@ class PodcastStudioApp {
 		this.recorder = null;
 		this.audioContext = null;
 		this.recording = false;
-		this.rosterItems = new Map();
-		this.meterValues = new Map();
 		this.outputIndicators = new Map();
 		this.trackRuntimeStats = new Map();
 		this.trackLevelNodes = new Map();
 		this.spectrograms = new Map();
 		this.participantMetrics = new Map();
 		this.markerLog = null;
-		this.rosterTimer = null;
 		this.levelOff = null;
 		this.recordStartedAt = null;
 		this.driveStatusNode = null;
@@ -270,14 +267,44 @@ class PodcastStudioApp {
 			ensureAudioContextResumed: () => this.ensureAudioContextResumed(),
 			getSessionLabel: () => this.session?.label,
 			virtualParticipants: this.virtualParticipants,
-			onRosterChange: () => this.refreshRoster(),
-			applyMeterValue: (uuid, value) => this.applyMeterValue(uuid, value)
+			onRosterChange: () => this.roster.refresh(),
+			applyMeterValue: (uuid, value) => this.roster.applyMeterValue(uuid, value)
 		});
 		this.guestBackup = new GuestBackupController({
 			getParticipants: () => this.getBackupParticipants(),
 			hasDriveAccess: () => Boolean(this.cloud?.hasDriveAccess()),
 			onReadinessChange: () => this.updateReadinessSummary(),
 			onRecordingStatusChange: () => this.refreshRecordingStatusLive()
+		});
+		this.roster = new RosterController({
+			getSession: () => this.session,
+			getParticipants: () => {
+				const participants = [...collectParticipants(this.session)];
+				this.virtualParticipants.forEach(participant => {
+					if (participant) {
+						participants.push(participant);
+					}
+				});
+				return participants;
+			},
+			createGuestBackupControl: participant => this.guestBackup.createRosterControl(participant),
+			teardownGuestBackupControl: uuid => this.guestBackup.teardownRosterControl(uuid),
+			updateGuestBackupAvailability: uuid => this.guestBackup.updateActionAvailability(uuid),
+			onOpenRemoteControls: uuid => this.openRemoteControls(uuid),
+			onParticipantSeen: participant => this.captureParticipantMetrics(participant),
+			onParticipantAdded: participant => this.tryAddParticipantToRecording(participant),
+			onParticipantRemoved: uuid => {
+				if (this.remoteOverlay && this.remoteOverlay.dataset.activeUuid === uuid) {
+					this.closeRemoteOverlay();
+				}
+			},
+			onBeforeRefresh: () => this.updateRoomIndicator(),
+			onAfterRefresh: () => {
+				this.guestBackup.updateControls();
+				this.updateReadinessSummary();
+				this.refreshRecordingStatusLive();
+				this.icecastController.refreshSourcesIfLive();
+			}
 		});
 		this.cloudBusy = {
 			drive: false,
@@ -400,8 +427,8 @@ class PodcastStudioApp {
 		this.updateRoomIndicator();
 		this.updateCloudFooter();
 		this.attachRecorderEvents();
-		this.refreshRoster();
-		this.startRosterLoop();
+		this.roster.refresh();
+		this.roster.startLoop();
 		this.levelOff = levelBus.on(LEVEL_EVENT, payload => this.updateMeterFromBus(payload));
 		try {
 			this.stopMeterBridge = await bridgeLegacyMeters();
@@ -1013,10 +1040,7 @@ class PodcastStudioApp {
 		// Host Input panel (director's mic)
 		const hostPanel = this.hostMicController.buildControls();
 
-		const rosterPanel = createElement("section", "podcast-panel");
-		this.rosterList = createElement("div", "roster-list");
-		rosterPanel.append(this.rosterList);
-		makeCollapsible(rosterPanel, "Talent Roster", "podcastStudio.collapse.roster");
+		const rosterPanel = this.roster.buildPanel();
 
 		const markersPanel = createElement("section", "podcast-panel");
 		const markerLogEl = createElement("div", "marker-log");
@@ -2373,164 +2397,6 @@ class PodcastStudioApp {
 		this.updateCloudFooter();
 	}
 
-	startRosterLoop() {
-		if (this.rosterTimer) {
-			clearInterval(this.rosterTimer);
-		}
-		this.rosterTimer = setInterval(() => this.refreshRoster(), ROSTER_REFRESH_MS);
-	}
-
-	refreshRoster() {
-		if (!this.session) {
-			return;
-		}
-		this.updateRoomIndicator();
-		const baseParticipants = collectParticipants(this.session);
-		const participants = [...baseParticipants];
-		this.virtualParticipants.forEach(participant => {
-			if (participant) {
-				participants.push(participant);
-			}
-		});
-		const activeIds = new Set();
-
-		participants.forEach(participant => {
-			activeIds.add(participant.uuid);
-			this.captureParticipantMetrics(participant);
-			const existing = this.rosterItems.get(participant.uuid);
-			if (existing) {
-				this.updateRosterItem(existing, participant);
-			} else {
-				const item = this.createRosterItem(participant);
-				this.rosterItems.set(participant.uuid, item);
-				this.rosterList.append(item);
-				// Add new participant to active recording
-				this.tryAddParticipantToRecording(participant);
-			}
-		});
-
-		Array.from(this.rosterItems.keys()).forEach(uuid => {
-			if (!activeIds.has(uuid)) {
-				const node = this.rosterItems.get(uuid);
-				if (node?.parentNode) {
-					node.parentNode.removeChild(node);
-				}
-				this.rosterItems.delete(uuid);
-				this.meterValues.delete(uuid);
-				this.guestBackup.teardownRosterControl(uuid);
-				if (this.remoteOverlay && this.remoteOverlay.dataset.activeUuid === uuid) {
-					this.closeRemoteOverlay();
-				}
-			}
-		});
-		this.guestBackup.updateControls();
-		this.updateReadinessSummary();
-		this.refreshRecordingStatusLive();
-		this.icecastController.refreshSourcesIfLive();
-	}
-
-	createRosterItem(participant) {
-		const item = createElement("div", "roster-item");
-		item.dataset.uuid = participant.uuid;
-		item.dataset.status = participant.status || "connecting";
-		if (participant.role) {
-			item.dataset.role = participant.role;
-		}
-
-		// Video thumbnail for guest preview
-		const videoThumb = document.createElement("video");
-		videoThumb.className = "roster-item__video-thumb";
-		videoThumb.muted = true;
-		videoThumb.playsInline = true;
-		videoThumb.autoplay = true;
-		videoThumb.dataset.noVideo = "true"; // hidden by default until video track available
-
-		const meta = createElement("div", "roster-meta");
-		meta.append(createElement("div", "roster-name", { text: participant.label }));
-		const idText = participant.streamID ? `Stream: ${participant.streamID}` : "Awaiting stream";
-		meta.append(createElement("div", "roster-id", { text: idText }));
-		const descriptorText = this.describeParticipantRole(participant);
-		if (descriptorText) {
-			meta.append(createElement("div", "roster-role", { text: descriptorText }));
-		}
-
-		const meter = createElement("div", "meter-bar", { "data-meter": participant.uuid });
-		meter.append(createElement("div", "meter-bar-fill"));
-
-		const mediaRow = createElement("div", "roster-item__media-row");
-		mediaRow.append(videoThumb, meter);
-
-		item.append(meta, mediaRow);
-
-		const actions = createElement("div", "roster-actions");
-		const actionRow = createElement("div", "roster-action-row");
-		let hasActions = false;
-		if (participant.role !== "host-mic") {
-			const controlButton = createElement("button", "roster-action-button", {
-				type: "button",
-				text: "Remote Controls",
-				title: "Open legacy remote controls for this guest."
-			});
-			controlButton.addEventListener("click", () => this.openRemoteControls(participant.uuid));
-			actionRow.append(controlButton);
-			hasActions = true;
-		}
-		const driveControls = this.guestBackup.createRosterControl(participant);
-		if (driveControls) {
-			actionRow.append(driveControls.button);
-			hasActions = true;
-		}
-		if (hasActions) {
-			if (driveControls?.status) {
-				actionRow.append(driveControls.status);
-			}
-			actions.append(actionRow);
-			item.append(actions);
-		}
-
-		this.updateRosterItem(item, participant);
-		return item;
-	}
-
-	updateRosterItem(item, participant) {
-		item.dataset.status = participant.status || "connecting";
-		const name = item.querySelector(".roster-name");
-		if (name) {
-			name.textContent = participant.label;
-		}
-		const id = item.querySelector(".roster-id");
-		if (id) {
-			id.textContent = participant.streamID ? `Stream: ${participant.streamID}` : "Awaiting stream";
-		}
-		item.dataset.role = participant.role || "";
-		const descriptor = item.querySelector(".roster-role");
-		if (descriptor) {
-			const descriptorText = this.describeParticipantRole(participant);
-			descriptor.textContent = descriptorText || "";
-			descriptor.style.display = descriptorText ? "" : "none";
-		}
-		this.applyMeterValue(participant.uuid, participant.audioLevel || 0);
-		this.guestBackup.updateActionAvailability(participant.uuid);
-
-		// Update video thumbnail if available
-		const videoThumb = item.querySelector(".roster-item__video-thumb");
-		if (videoThumb && this.session?.rpcs) {
-			const peer = this.session.rpcs[participant.uuid];
-			const videoTracks = peer?.streamSrc?.getVideoTracks?.() || [];
-			if (videoTracks.length > 0) {
-				if (!videoThumb.srcObject || videoThumb.srcObject.getVideoTracks()[0]?.id !== videoTracks[0].id) {
-					videoThumb.srcObject = new MediaStream(videoTracks);
-				}
-				videoThumb.dataset.noVideo = "false";
-			} else {
-				if (videoThumb.srcObject) {
-					videoThumb.srcObject = null;
-				}
-				videoThumb.dataset.noVideo = "true";
-			}
-		}
-	}
-
 	ensureRemoteOverlay() {
 		if (this.remoteOverlay && this.remoteOverlayContent) {
 			return this.remoteOverlay;
@@ -2611,7 +2477,7 @@ class PodcastStudioApp {
 		}
 		body.innerHTML = "";
 
-		const rosterNode = this.rosterItems.get(uuid);
+		const rosterNode = this.roster.getItem(uuid);
 		let label = "";
 		if (rosterNode) {
 			const nameNode = rosterNode.querySelector(".roster-name");
@@ -2841,32 +2707,13 @@ class PodcastStudioApp {
 		}
 	}
 
-	describeParticipantRole(participant) {
-		if (!participant) {
-			return "";
-		}
-		if (participant.role === "host-mic") {
-			return "Local recording input";
-		}
-		return "";
-	}
-
-	applyMeterValue(uuid, value) {
-		const percent = Math.min(100, Math.max(0, value));
-		this.meterValues.set(uuid, percent);
-		const meter = this.rosterList.querySelector(`[data-meter="${uuid}"] .meter-bar-fill`);
-		if (meter) {
-			meter.style.width = `${percent}%`;
-		}
-	}
-
 	updateMeterFromBus(payload) {
 		if (!payload?.uuid) {
 			return;
 		}
 		const peak = payload.peak || 0;
 		const level = Math.min(100, Math.round(peak * 120));
-		this.applyMeterValue(payload.uuid, level);
+		this.roster.applyMeterValue(payload.uuid, level);
 		this.updateTrackLevelVisual(payload.uuid, level);
 	}
 
@@ -3363,11 +3210,8 @@ class PodcastStudioApp {
 
 	dispose() {
 		this.guestBackup.dispose();
+		this.roster.dispose();
 		this.stopRecordingStatusTimer();
-		if (this.rosterTimer) {
-			clearInterval(this.rosterTimer);
-			this.rosterTimer = null;
-		}
 		if (this.diskStateListener) {
 			window.removeEventListener(PODCAST_DISK_EVENT, this.diskStateListener);
 			this.diskStateListener = null;
