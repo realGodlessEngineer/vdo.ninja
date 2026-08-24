@@ -2,6 +2,6 @@ const params = new URLSearchParams(window.location.search);
 const studioMode = params.has("podcast");
 
 if (studioMode) {
-	import("./studio.js?v=34");
+	import("./studio.js?v=35");
 	document.body.style.display = "unset";
 }
