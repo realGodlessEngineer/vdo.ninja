@@ -14,6 +14,7 @@ import { MarkerLog } from "./marker-log.js?v=1";
 import { HostMicController } from "./host-mic-controller.js?v=1";
 import { GuestBackupController } from "./guest-backup-controller.js?v=1";
 import { RosterController } from "./roster-controller.js?v=1";
+import { RemoteControlsController } from "./remote-controls-controller.js?v=1";
 
 const STUDIO_ROOT_ID = "podcast-root";
 const DROPBOX_GUIDE_URL = "/cloud.html#dropbox";
@@ -290,14 +291,10 @@ class PodcastStudioApp {
 			createGuestBackupControl: participant => this.guestBackup.createRosterControl(participant),
 			teardownGuestBackupControl: uuid => this.guestBackup.teardownRosterControl(uuid),
 			updateGuestBackupAvailability: uuid => this.guestBackup.updateActionAvailability(uuid),
-			onOpenRemoteControls: uuid => this.openRemoteControls(uuid),
+			onOpenRemoteControls: uuid => this.remoteControls.open(uuid),
 			onParticipantSeen: participant => this.captureParticipantMetrics(participant),
 			onParticipantAdded: participant => this.tryAddParticipantToRecording(participant),
-			onParticipantRemoved: uuid => {
-				if (this.remoteOverlay && this.remoteOverlay.dataset.activeUuid === uuid) {
-					this.closeRemoteOverlay();
-				}
-			},
+			onParticipantRemoved: uuid => this.remoteControls.closeIfActive(uuid),
 			onBeforeRefresh: () => this.updateRoomIndicator(),
 			onAfterRefresh: () => {
 				this.guestBackup.updateControls();
@@ -305,6 +302,9 @@ class PodcastStudioApp {
 				this.refreshRecordingStatusLive();
 				this.icecastController.refreshSourcesIfLive();
 			}
+		});
+		this.remoteControls = new RemoteControlsController({
+			getRosterItem: uuid => this.roster.getItem(uuid)
 		});
 		this.cloudBusy = {
 			drive: false,
@@ -334,14 +334,6 @@ class PodcastStudioApp {
 		this.inviteStatusNode = null;
 		this.inviteOptionNodes = {};
 		this.inviteCopyTimer = null;
-		this.remoteOverlay = null;
-		this.remoteOverlayContent = null;
-		this.remoteControlState = {
-			activeUuid: null,
-			element: null,
-			placeholder: null,
-			wrapper: null
-		};
 		this.cloudProgressNodes = {
 			drive: null,
 			dropbox: null
@@ -2397,150 +2389,6 @@ class PodcastStudioApp {
 		this.updateCloudFooter();
 	}
 
-	ensureRemoteOverlay() {
-		if (this.remoteOverlay && this.remoteOverlayContent) {
-			return this.remoteOverlay;
-		}
-		const overlay = createElement("div", "remote-overlay");
-		overlay.dataset.podcastOverlay = "true";
-		overlay.dataset.visible = "false";
-
-		const panel = createElement("div", "remote-overlay__panel");
-		const header = createElement("div", "remote-overlay__header");
-		const title = createElement("h3", "remote-overlay__title", { text: "Remote controls" });
-		const closeButton = createElement("button", "remote-overlay__close", { type: "button", text: "Close", title: "Close remote controls." });
-		closeButton.addEventListener("click", () => this.closeRemoteOverlay());
-		header.append(title, closeButton);
-
-		const body = createElement("div", "remote-overlay__body");
-		panel.append(header, body);
-		overlay.append(panel);
-
-		overlay.addEventListener("click", event => {
-			if (event.target === overlay) {
-				this.closeRemoteOverlay();
-			}
-		});
-
-		document.body.appendChild(overlay);
-		this.remoteOverlay = overlay;
-		this.remoteOverlayContent = body;
-		return overlay;
-	}
-
-	restoreRemoteControls() {
-		const state = this.remoteControlState;
-		if (!state || !state.element) {
-			if (this.remoteOverlay) {
-				delete this.remoteOverlay.dataset.activeUuid;
-			}
-			return;
-		}
-		const { element, placeholder, wrapper } = state;
-		try {
-			if (wrapper && wrapper.parentNode) {
-				wrapper.parentNode.removeChild(wrapper);
-			}
-		} catch (error) {
-			console.warn("Failed to remove remote controls wrapper", error);
-		}
-		if (placeholder && placeholder.parentNode) {
-			try {
-				placeholder.parentNode.insertBefore(element, placeholder);
-				placeholder.parentNode.removeChild(placeholder);
-			} catch (error) {
-				console.warn("Failed to restore remote controls container", error);
-			}
-		}
-		this.remoteControlState = {
-			activeUuid: null,
-			element: null,
-			placeholder: null,
-			wrapper: null
-		};
-		if (this.remoteOverlay) {
-			delete this.remoteOverlay.dataset.activeUuid;
-		}
-	}
-
-	openRemoteControls(uuid) {
-		if (!uuid) {
-			return;
-		}
-		if (this.remoteControlState?.activeUuid && this.remoteControlState.activeUuid !== uuid) {
-			this.restoreRemoteControls();
-		}
-		const overlay = this.ensureRemoteOverlay();
-		const body = this.remoteOverlayContent;
-		if (!overlay || !body) {
-			return;
-		}
-		body.innerHTML = "";
-
-		const rosterNode = this.roster.getItem(uuid);
-		let label = "";
-		if (rosterNode) {
-			const nameNode = rosterNode.querySelector(".roster-name");
-			label = nameNode ? nameNode.textContent : "";
-		}
-		const headerTitle = overlay.querySelector(".remote-overlay__title");
-		if (headerTitle) {
-			headerTitle.textContent = label ? `Remote controls • ${label}` : "Remote controls";
-		}
-
-		const existingState = this.remoteControlState || {};
-		if (existingState.activeUuid && existingState.activeUuid === uuid && existingState.wrapper) {
-			body.append(existingState.wrapper);
-			overlay.dataset.visible = "true";
-			overlay.dataset.activeUuid = uuid;
-			return;
-		}
-
-		const source = document.getElementById(`container_${uuid}`);
-		if (!source) {
-			body.append(
-				createElement("div", "remote-overlay__empty", {
-					text: "Legacy director controls are still loading. Try again once the guest is fully connected."
-				})
-			);
-			overlay.dataset.visible = "true";
-			overlay.dataset.activeUuid = uuid;
-			return;
-		}
-
-		const placeholder = document.createElement("div");
-		placeholder.dataset.podcastPlaceholder = "remote-controls";
-		source.parentNode?.insertBefore(placeholder, source);
-
-		source.classList.remove("hidden");
-
-		const wrapper = createElement("div", "remote-overlay__legacy");
-		wrapper.dataset.uuid = uuid;
-		wrapper.append(source);
-		body.append(wrapper);
-
-		this.remoteControlState = {
-			activeUuid: uuid,
-			element: source,
-			placeholder,
-			wrapper
-		};
-
-		overlay.dataset.visible = "true";
-		overlay.dataset.activeUuid = uuid;
-	}
-
-	closeRemoteOverlay() {
-		if (!this.remoteOverlay) {
-			return;
-		}
-		this.restoreRemoteControls();
-		this.remoteOverlay.dataset.visible = "false";
-		if (this.remoteOverlayContent) {
-			this.remoteOverlayContent.innerHTML = "";
-		}
-	}
-
 	openHelpModal() {
 		if (this.helpOverlay) {
 			this.helpOverlay.dataset.visible = "true";
@@ -3211,6 +3059,7 @@ class PodcastStudioApp {
 	dispose() {
 		this.guestBackup.dispose();
 		this.roster.dispose();
+		this.remoteControls.dispose();
 		this.stopRecordingStatusTimer();
 		if (this.diskStateListener) {
 			window.removeEventListener(PODCAST_DISK_EVENT, this.diskStateListener);
@@ -3232,7 +3081,6 @@ class PodcastStudioApp {
 		this.hostMicController.dispose().catch(error => {
 			console.warn("Failed to disable host microphone during dispose", error);
 		});
-		this.restoreRemoteControls();
 		if (this.chatModule) {
 			try {
 				if (this.chatModule.dataset) {
@@ -3304,11 +3152,6 @@ class PodcastStudioApp {
 			clearTimeout(this.inviteCopyTimer);
 			this.inviteCopyTimer = null;
 		}
-		if (this.remoteOverlay && this.remoteOverlay.parentNode) {
-			this.remoteOverlay.parentNode.removeChild(this.remoteOverlay);
-		}
-		this.remoteOverlay = null;
-		this.remoteOverlayContent = null;
 	}
 }
 
