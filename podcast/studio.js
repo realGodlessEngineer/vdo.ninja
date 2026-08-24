@@ -18,6 +18,7 @@ import { RemoteControlsController } from "./remote-controls-controller.js?v=1";
 import { HelpModalController } from "./help-modal-controller.js?v=1";
 import { UploadProgressController } from "./upload-progress-controller.js?v=1";
 import { DiskRecordingController } from "./disk-recording-controller.js?v=1";
+import { InviteLinkController } from "./invite-link-controller.js?v=1";
 
 const STUDIO_ROOT_ID = "podcast-root";
 const DROPBOX_GUIDE_URL = "/cloud.html#dropbox";
@@ -316,6 +317,9 @@ class PodcastStudioApp {
 			featureEnabled: STUDIO_DISK_FEATURE_FLAG,
 			onReadinessChange: () => this.updateReadinessSummary()
 		});
+		this.inviteLink = new InviteLinkController({
+			getRoomName: () => this.resolveRoomName()
+		});
 		this.cloudBusy = {
 			drive: false,
 			dropbox: false
@@ -339,11 +343,6 @@ class PodcastStudioApp {
 		this.dropboxTokenInput = null;
 		this.dropboxTokenRow = null;
 		this.dropboxGuideRow = null;
-		this.inviteLinkInput = null;
-		this.inviteCopyButton = null;
-		this.inviteStatusNode = null;
-		this.inviteOptionNodes = {};
-		this.inviteCopyTimer = null;
 		this.chatModule = null;
 		this.chatPlaceholder = null;
 		this.chatPanel = null;
@@ -455,29 +454,7 @@ class PodcastStudioApp {
 				persistStoredRoomState({ room: this.roomName, password: stored?.password || "" });
 			}
 		}
-		this.updateInviteLink();
-	}
-
-	describeInviteOptions() {
-		const labels = [];
-		if (this.inviteOptionNodes.disableVideo?.checked) {
-			labels.push("Audio only");
-		} else {
-			labels.push("Video preview");
-		}
-		if (this.inviteOptionNodes.proAudio?.checked) {
-			labels.push("Pro audio");
-		}
-		if (this.inviteOptionNodes.disableAec?.checked) {
-			labels.push("AEC off");
-		}
-		if (this.inviteOptionNodes.disableDenoise?.checked) {
-			labels.push("Denoise off");
-		}
-		if (this.inviteOptionNodes.disableAgc?.checked) {
-			labels.push("AGC off");
-		}
-		return labels.join(" • ");
+		this.inviteLink.refresh();
 	}
 
 	applyDirectorAudioDefaults() {
@@ -508,148 +485,6 @@ class PodcastStudioApp {
 			} catch (error) {
 				console.warn("applyStereoDefaults failed", error);
 			}
-		}
-	}
-
-	updateInviteLink() {
-		if (!this.inviteLinkInput) {
-			return;
-		}
-		const room = this.resolveRoomName();
-		if (!room) {
-			this.inviteLinkInput.value = "Set a room name to generate a guest link";
-			this.inviteLinkInput.dataset.state = "placeholder";
-			if (this.inviteCopyButton) {
-				this.inviteCopyButton.disabled = true;
-			}
-			if (this.inviteStatusNode) {
-				this.inviteStatusNode.textContent = "";
-			}
-			return;
-		}
-		this.inviteLinkInput.dataset.state = "ready";
-		if (this.inviteCopyButton) {
-			this.inviteCopyButton.disabled = false;
-		}
-		const guestUrl = new URL(window.location.href);
-		guestUrl.search = "";
-		guestUrl.hash = "";
-
-		const params = new URLSearchParams();
-		params.set("room", room);
-		params.set("style", "2");
-		params.set("showlabel", "1");
-		params.set("tips", "1");
-		params.set("label", "");
-
-		const options = this.inviteOptionNodes || {};
-		const summary = [];
-		summary.push("Label prompt");
-		summary.push("Name tag overlay");
-		summary.push("Join tips");
-
-		// Video is ON by default
-		if (options.disableVideo?.checked) {
-			params.set("miconly", "1");
-			summary.push("Audio only");
-		} else {
-			summary.push("Video enabled");
-		}
-
-		if (options.proAudio?.checked) {
-			params.set("proaudio", "1");
-			params.set("stereo", "1");
-			params.set("audiobitrate", "256");
-			summary.push("Pro audio");
-		} else {
-			params.delete("proaudio");
-			params.delete("stereo");
-			params.delete("audiobitrate");
-		}
-
-		if (options.disableAec?.checked) {
-			params.set("aec", "0");
-			params.set("echocancellation", "0");
-			summary.push("AEC off");
-		} else {
-			params.delete("aec");
-			params.delete("echocancellation");
-		}
-
-		if (options.disableDenoise?.checked) {
-			params.set("denoise", "0");
-			summary.push("Denoise off");
-		} else {
-			params.delete("denoise");
-		}
-
-		if (options.disableAgc?.checked) {
-			params.set("agc", "0");
-			params.set("autogain", "0");
-			summary.push("AGC off");
-		} else {
-			params.delete("agc");
-			params.delete("autogain");
-		}
-
-		if (options.guestRecordBackup?.checked) {
-			params.set("autorecordlocal", "-128");
-			summary.push("Audio backup");
-		} else {
-			params.delete("autorecordlocal");
-		}
-
-		guestUrl.search = params.toString();
-		const value = guestUrl.toString();
-		this.inviteLinkInput.value = value;
-		if (this.inviteStatusNode) {
-			this.inviteStatusNode.textContent = summary.length ? summary.join(" • ") : "Default settings";
-		}
-	}
-
-	async copyInviteLink() {
-		if (!this.inviteLinkInput || this.inviteLinkInput.dataset.state === "placeholder") {
-			return;
-		}
-		const value = this.inviteLinkInput.value;
-		if (!value) {
-			return;
-		}
-		const notify = (message, variant = "info") => {
-			if (!this.inviteStatusNode) {
-				return;
-			}
-			this.inviteStatusNode.textContent = message;
-			this.inviteStatusNode.dataset.variant = variant;
-			if (this.inviteCopyTimer) {
-				clearTimeout(this.inviteCopyTimer);
-			}
-			this.inviteCopyTimer = setTimeout(() => {
-				this.inviteStatusNode.dataset.variant = "";
-				this.updateInviteLink();
-			}, 3500);
-		};
-		try {
-			if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
-				await navigator.clipboard.writeText(value);
-				notify("Guest link copied.", "success");
-				return;
-			}
-		} catch (error) {
-			console.warn("Navigator clipboard copy failed", error);
-		}
-		try {
-			this.inviteLinkInput.focus();
-			this.inviteLinkInput.select();
-			const success = document.execCommand("copy");
-			if (success) {
-				notify("Guest link copied.", "success");
-			} else {
-				notify("Select and copy the link manually.", "warning");
-			}
-		} catch (error) {
-			console.warn("Fallback copy failed", error);
-			notify("Select and copy the link manually.", "warning");
 		}
 	}
 
@@ -933,53 +768,7 @@ class PodcastStudioApp {
 		const consoleGrid = createElement("div", "podcast-console-grid");
 		consoleColumn.append(consoleGrid);
 
-		const invitePanel = createElement("section", "podcast-panel invite-panel");
-		invitePanel.classList.add("console-grid__span-2");
-		const inviteIntro = createElement("p", "invite-copy", {
-			text: "Share a pro audio-ready link with guests. Tweak processing flags before copying."
-		});
-		const inviteLinkRow = createElement("div", "invite-link-row");
-		this.inviteLinkInput = createElement("input", "invite-link-input", {
-			type: "text",
-			readonly: "true",
-			value: "",
-			title: "Guest invite link (click to select)."
-		});
-		this.inviteLinkInput.addEventListener("focus", () => {
-			try {
-				this.inviteLinkInput.select();
-			} catch (error) {
-				console.warn("Invite link select failed", error);
-			}
-		});
-		this.inviteCopyButton = createElement("button", "invite-link-copy", { type: "button", text: "Copy link", title: "Copy the guest invite link." });
-		this.inviteCopyButton.addEventListener("click", () => this.copyInviteLink());
-		inviteLinkRow.append(this.inviteLinkInput, this.inviteCopyButton);
-		this.inviteStatusNode = createElement("div", "invite-status");
-
-		const inviteOptions = createElement("div", "invite-options");
-		const optionDefs = [
-			{ key: "disableVideo", label: "Disable video preview", defaultChecked: false },
-			{ key: "proAudio", label: "Enable pro audio (stereo, 256 kbps)", defaultChecked: true },
-			{ key: "disableAec", label: "Disable echo cancellation", defaultChecked: true },
-			{ key: "disableDenoise", label: "Disable noise reduction", defaultChecked: true },
-			{ key: "disableAgc", label: "Disable auto gain control", defaultChecked: true },
-			{ key: "guestRecordBackup", label: "Guest-side audio record backup", defaultChecked: true }
-		];
-		optionDefs.forEach(option => {
-			const optionLabel = createElement("label", "invite-option");
-			const checkbox = createElement("input", "invite-option__checkbox", { type: "checkbox" });
-			checkbox.checked = option.defaultChecked;
-			checkbox.title = "Applies to the generated guest link.";
-			optionLabel.title = option.label;
-			checkbox.addEventListener("change", () => this.updateInviteLink());
-			optionLabel.append(checkbox, createElement("span", "invite-option__label", { text: option.label }));
-			inviteOptions.append(optionLabel);
-			this.inviteOptionNodes[option.key] = checkbox;
-		});
-
-		invitePanel.append(inviteIntro, inviteLinkRow, this.inviteStatusNode, inviteOptions);
-		makeCollapsible(invitePanel, "Guest Invites", "podcastStudio.collapse.invites");
+		const invitePanel = this.inviteLink.buildPanel();
 
 		const sessionToolsPanel = createElement("section", "podcast-panel session-tools");
 		sessionToolsPanel.classList.add("console-grid__span-2");
@@ -1280,7 +1069,7 @@ class PodcastStudioApp {
 		this.updateReadinessSummary();
 		this.setCloudMessage("drive", "");
 		this.setCloudMessage("dropbox", "");
-		this.updateInviteLink();
+		this.inviteLink.refresh();
 		this.toggleChatPanel(false);
 		requestAnimationFrame(() => this.toggleChatPanel(false));
 	}
@@ -2589,6 +2378,7 @@ class PodcastStudioApp {
 		this.help.dispose();
 		this.uploadProgress.dispose();
 		this.diskRecording.dispose();
+		this.inviteLink?.dispose();
 		this.stopRecordingStatusTimer();
 		if (this.diskStateListener) {
 			window.removeEventListener(PODCAST_DISK_EVENT, this.diskStateListener);
@@ -2676,10 +2466,6 @@ class PodcastStudioApp {
 		if (this.stopMeterBridge) {
 			this.stopMeterBridge();
 			this.stopMeterBridge = null;
-		}
-		if (this.inviteCopyTimer) {
-			clearTimeout(this.inviteCopyTimer);
-			this.inviteCopyTimer = null;
 		}
 	}
 }
