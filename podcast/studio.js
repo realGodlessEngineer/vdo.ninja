@@ -16,6 +16,7 @@ import { GuestBackupController } from "./guest-backup-controller.js?v=1";
 import { RosterController } from "./roster-controller.js?v=1";
 import { RemoteControlsController } from "./remote-controls-controller.js?v=1";
 import { HelpModalController } from "./help-modal-controller.js?v=1";
+import { UploadProgressController } from "./upload-progress-controller.js?v=1";
 
 const STUDIO_ROOT_ID = "podcast-root";
 const DROPBOX_GUIDE_URL = "/cloud.html#dropbox";
@@ -23,7 +24,6 @@ const PODCAST_CLOUD_EVENT = "podcast-cloud-status";
 const PODCAST_DISK_EVENT = "podcast-disk-state";
 const PODCAST_RECORD_PLAN_EVENT = "podcast-record-plan";
 const PODCAST_RECORD_STATUS_EVENT = "podcast-record-status";
-const UPLOAD_TRACKER_COOLDOWN_MS = 15000;
 const STUDIO_DISK_FEATURE_FLAG = (() => {
 	let enabled = true;
 	if (typeof urlParams !== "undefined" && urlParams) {
@@ -308,6 +308,9 @@ class PodcastStudioApp {
 			getRosterItem: uuid => this.roster.getItem(uuid)
 		});
 		this.help = new HelpModalController();
+		this.uploadProgress = new UploadProgressController({
+			describeService: service => this.describeService(service)
+		});
 		this.cloudBusy = {
 			drive: false,
 			dropbox: false
@@ -336,14 +339,6 @@ class PodcastStudioApp {
 		this.inviteStatusNode = null;
 		this.inviteOptionNodes = {};
 		this.inviteCopyTimer = null;
-		this.cloudProgressNodes = {
-			drive: null,
-			dropbox: null
-		};
-		this.uploadTrackers = {
-			drive: new Map(),
-			dropbox: new Map()
-		};
 		this.chatModule = null;
 		this.chatPlaceholder = null;
 		this.chatPanel = null;
@@ -1297,15 +1292,8 @@ class PodcastStudioApp {
 		this.cloudSummaryNode = createElement("div", "iso-config-summary__item", { text: "Status: checking..." });
 		this.cloudSummaryNode.dataset.state = "pending";
 		const serviceProgress = createElement("div", "iso-config-summary__services");
-		this.cloudProgressNodes.drive = createElement("div", "iso-config-summary__item iso-config-summary__item--service", {
-			text: "Drive uploads idle"
-		});
-		this.cloudProgressNodes.drive.dataset.state = "idle";
-		this.cloudProgressNodes.dropbox = createElement("div", "iso-config-summary__item iso-config-summary__item--service", {
-			text: "Dropbox uploads idle"
-		});
-		this.cloudProgressNodes.dropbox.dataset.state = "idle";
-		serviceProgress.append(this.cloudProgressNodes.drive, this.cloudProgressNodes.dropbox);
+		const progressNodes = this.uploadProgress.createProgressNodes();
+		serviceProgress.append(progressNodes.drive, progressNodes.dropbox);
 		this.isoSummary.append(this.cloudSummaryNode, serviceProgress);
 		this.isoSummary.style.display = "none";
 
@@ -1631,7 +1619,7 @@ class PodcastStudioApp {
 			this.markerButton.disabled = false;
 			this.showOutputsMessage("Recording… tracks will appear as media arrives.");
 			this.hostMicController.updateUI();
-			this.setUploadProgressPending(true);
+			this.uploadProgress.setPending(true);
 			if (this.recordingPlan?.sync) {
 				this.recordingPlan.sync.start = {
 					wallClock: this.recordStartedAt,
@@ -2262,7 +2250,7 @@ class PodcastStudioApp {
 			this.logRecordingEvent("record:error", { stage: "start", message: error?.message || "unknown error" });
 			this.setRecordingStatus("Recording idle", "error");
 			this.updateRecordingPlanStatus("error", { error: error?.message || "start failed", events: this.recordingPlan?.events || [] });
-			this.setUploadProgressPending(false);
+			this.uploadProgress.setPending(false);
 		}
 	}
 
@@ -2332,7 +2320,7 @@ class PodcastStudioApp {
 		const files = filesMap || this.recorder.getFiles();
 		if (!files || files.size === 0) {
 			this.showOutputsMessage("No media captured.");
-			this.setUploadProgressPending(false);
+			this.uploadProgress.setPending(false);
 			return;
 		}
 		this.cleanupDownloadUrls();
@@ -2342,7 +2330,7 @@ class PodcastStudioApp {
 		this.outputsContainer.classList.add("timeline-results");
 		this.outputsContainer.innerHTML = "";
 		const uploadPromises = [];
-		this.setUploadProgressPending(false);
+		this.uploadProgress.setPending(false);
 		files.forEach((meta, key) => {
 			if (!meta?.blob) {
 				return;
@@ -2410,7 +2398,7 @@ class PodcastStudioApp {
 			const dropboxText = this.cloud?.hasDropboxAccess() ? "Dropbox linked" : "Dropbox link pending";
 			this.dropboxStatusNode.textContent = dropboxText;
 		}
-		this.refreshUploadProgress("dropbox");
+		this.uploadProgress.refresh("dropbox");
 		this.updateCloudLinkUI();
 		this.updateReadinessSummary();
 	}
@@ -2592,131 +2580,6 @@ class PodcastStudioApp {
 		return line;
 	}
 
-	setUploadProgressPending(pending) {
-		["drive", "dropbox"].forEach(service => {
-			const node = this.cloudProgressNodes?.[service];
-			if (!node) {
-				return;
-			}
-			if (pending) {
-				node.dataset.state = "pending";
-				node.textContent = `${this.describeService(service)} uploads pending (recording in progress)`;
-			} else if (!this.uploadTrackers?.[service]?.size) {
-				node.dataset.state = "idle";
-				node.textContent = `${this.describeService(service)} uploads idle`;
-			}
-		});
-	}
-
-	registerUploadTask(service, meta) {
-		if (!service || !this.uploadTrackers?.[service]) {
-			return null;
-		}
-		const tracker = this.uploadTrackers[service];
-		const key = `${service}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-		const bytesTotal = meta?.blob?.size || 0;
-		tracker.set(key, {
-			key,
-			label: meta?.participant?.label || meta?.filename || "Track",
-			bytesUploaded: 0,
-			bytesTotal,
-			status: "pending",
-			startedAt: Date.now()
-		});
-		this.refreshUploadProgress(service);
-		return key;
-	}
-
-	updateUploadTask(service, key, { uploaded, total, status } = {}) {
-		if (!service || !key || !this.uploadTrackers?.[service]) {
-			return;
-		}
-		const tracker = this.uploadTrackers[service];
-		const entry = tracker.get(key);
-		if (!entry) {
-			return;
-		}
-		if (typeof uploaded === "number") {
-			entry.bytesUploaded = uploaded;
-		}
-		if (typeof total === "number" && total >= 0) {
-			entry.bytesTotal = total;
-		}
-		if (status) {
-			entry.status = status;
-		}
-		this.refreshUploadProgress(service);
-	}
-
-	finalizeUploadTask(service, key, status = "uploaded") {
-		if (!service || !key || !this.uploadTrackers?.[service]) {
-			return;
-		}
-		const tracker = this.uploadTrackers[service];
-		const entry = tracker.get(key);
-		if (!entry) {
-			return;
-		}
-		entry.status = status;
-		if (!entry.bytesTotal) {
-			entry.bytesTotal = entry.bytesUploaded;
-		}
-		tracker.set(key, entry);
-		this.refreshUploadProgress(service);
-		const ttl = status === "error" ? UPLOAD_TRACKER_COOLDOWN_MS * 2 : status === "queued" ? UPLOAD_TRACKER_COOLDOWN_MS * 4 : UPLOAD_TRACKER_COOLDOWN_MS;
-		setTimeout(() => {
-			const current = tracker.get(key);
-			if (current && current.status === status) {
-				tracker.delete(key);
-				this.refreshUploadProgress(service);
-			}
-		}, ttl);
-	}
-
-	refreshUploadProgress(service) {
-		const node = this.cloudProgressNodes?.[service];
-		const tracker = this.uploadTrackers?.[service];
-		if (!node || !tracker) {
-			return;
-		}
-		if (!tracker.size) {
-			node.textContent = `${this.describeService(service)} uploads idle`;
-			node.dataset.state = "idle";
-			return;
-		}
-		const entries = Array.from(tracker.values());
-		const errors = entries.filter(entry => entry.status === "error");
-		const active = entries.filter(entry => entry.status === "pending" || entry.status === "uploading");
-		const queued = entries.filter(entry => entry.status === "queued");
-		const completed = entries.filter(entry => entry.status === "uploaded");
-		const skipped = entries.filter(entry => entry.status === "skipped");
-		const uploadedBytes = entries.reduce((total, entry) => total + Math.min(entry.bytesUploaded || 0, entry.bytesTotal || entry.bytesUploaded || 0), 0);
-		const totalBytes = entries.reduce((total, entry) => total + (entry.bytesTotal || entry.bytesUploaded || 0), 0);
-		const percentage = totalBytes ? Math.min(100, Math.round((uploadedBytes / totalBytes) * 100)) : 0;
-		if (errors.length) {
-			node.textContent = `${this.describeService(service)} upload error (${errors.length})`;
-			node.dataset.state = "error";
-			return;
-		}
-		if (active.length) {
-			node.textContent = `${this.describeService(service)} uploading ${active.length} file${active.length === 1 ? "" : "s"} • ${percentage}%`;
-			node.dataset.state = "uploading";
-			return;
-		}
-		if (queued.length) {
-			node.textContent = `${this.describeService(service)} queued ${queued.length} file${queued.length === 1 ? "" : "s"} • finalizing`;
-			node.dataset.state = "pending";
-			return;
-		}
-		if (completed.length || skipped.length) {
-			node.textContent = `${this.describeService(service)} uploads complete`;
-			node.dataset.state = "complete";
-			return;
-		}
-		node.textContent = `${this.describeService(service)} uploads idle`;
-		node.dataset.state = "idle";
-	}
-
 	applyUploadResult(element, result) {
 		if (!element || !result) {
 			return;
@@ -2839,7 +2702,7 @@ class PodcastStudioApp {
 		}
 		if (!canDropbox) return;
 
-		const uploadKey = this.registerUploadTask("dropbox", meta);
+		const uploadKey = this.uploadProgress.registerTask("dropbox", meta);
 		try {
 			const results = await this.cloud.uploadBlob(meta.blob, {
 				filename: meta.filename,
@@ -2849,7 +2712,7 @@ class PodcastStudioApp {
 					if (progress?.service === "dropbox" && dropboxLine) {
 						dropboxLine.textContent = `${this.describeService("dropbox")}: ${progress.percentage || 0}%`;
 						if (uploadKey) {
-							this.updateUploadTask("dropbox", uploadKey, {
+							this.uploadProgress.updateTask("dropbox", uploadKey, {
 								uploaded: progress.uploaded,
 								total: progress.total,
 								status: "uploading"
@@ -2862,7 +2725,7 @@ class PodcastStudioApp {
 			this.applyUploadResult(dropboxLine, results.dropbox);
 			if (uploadKey) {
 				const status = this.normalizeUploadStatus("dropbox", results.dropbox?.status || "unknown");
-				this.finalizeUploadTask("dropbox", uploadKey, status);
+				this.uploadProgress.finalizeTask("dropbox", uploadKey, status);
 			}
 		} catch (error) {
 			console.error("Dropbox upload failed", error);
@@ -2871,7 +2734,7 @@ class PodcastStudioApp {
 				dropboxLine.dataset.status = "error";
 			}
 			if (uploadKey) {
-				this.finalizeUploadTask("dropbox", uploadKey, "error");
+				this.uploadProgress.finalizeTask("dropbox", uploadKey, "error");
 			}
 		} finally {
 			this.updateCloudFooter();
@@ -2897,6 +2760,7 @@ class PodcastStudioApp {
 		this.roster.dispose();
 		this.remoteControls.dispose();
 		this.help.dispose();
+		this.uploadProgress.dispose();
 		this.stopRecordingStatusTimer();
 		if (this.diskStateListener) {
 			window.removeEventListener(PODCAST_DISK_EVENT, this.diskStateListener);
