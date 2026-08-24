@@ -1,5 +1,5 @@
 import { waitForLegacySession, levelBus, LEVEL_EVENT, MultiTrackRecorder, CloudUploadCoordinator, bridgeLegacyMeters } from "../core/index.js";
-import { readDiskRecordingState, isDiskRecordingEnabled, setDiskRecordingEnabled, verifyStoredDiskRecordingDirectory, chooseDiskRecordingDirectory, readDiskDirectoryHandle } from "./disk-recording-store.js?v=1";
+import { readDiskRecordingState, verifyStoredDiskRecordingDirectory, readDiskDirectoryHandle } from "./disk-recording-store.js?v=1";
 import { readCloudLinkStatus, isCloudLinkFresh, markCloudLinked, markCloudUnlinked } from "./cloud-link-store.js?v=1";
 import { readCaptureMode, writeCaptureMode } from "./capture-mode-store.js?v=1";
 import { readPreflightState, writePreflightState, isPreflightFresh } from "./preflight-store.js?v=1";
@@ -17,6 +17,7 @@ import { RosterController } from "./roster-controller.js?v=1";
 import { RemoteControlsController } from "./remote-controls-controller.js?v=1";
 import { HelpModalController } from "./help-modal-controller.js?v=1";
 import { UploadProgressController } from "./upload-progress-controller.js?v=1";
+import { DiskRecordingController } from "./disk-recording-controller.js?v=1";
 
 const STUDIO_ROOT_ID = "podcast-root";
 const DROPBOX_GUIDE_URL = "/cloud.html#dropbox";
@@ -311,6 +312,10 @@ class PodcastStudioApp {
 		this.uploadProgress = new UploadProgressController({
 			describeService: service => this.describeService(service)
 		});
+		this.diskRecording = new DiskRecordingController({
+			featureEnabled: STUDIO_DISK_FEATURE_FLAG,
+			onReadinessChange: () => this.updateReadinessSummary()
+		});
 		this.cloudBusy = {
 			drive: false,
 			dropbox: false
@@ -347,11 +352,6 @@ class PodcastStudioApp {
 		this.chatCollapsed = false;
 		this.chatPopoutAnchor = null;
 		this.chatCollapsedHint = null;
-		this.diskControls = null;
-		this.diskToggleButton = null;
-		this.diskFolderButton = null;
-		this.diskStatusNode = null;
-		this.diskRecordingEnabled = isDiskRecordingEnabled();
 		this.diskStateListener = null;
 		this.cloudStateListener = null;
 		this.cloudSummaryNode = null;
@@ -406,7 +406,7 @@ class PodcastStudioApp {
 		this.updateRecordingButtons();
 		if (STUDIO_DISK_FEATURE_FLAG) {
 			this.diskStateListener = () => {
-				this.updateDiskRecordingUI();
+				this.diskRecording.updateUI();
 				this.updateReadinessSummary();
 			};
 			window.addEventListener(PODCAST_DISK_EVENT, this.diskStateListener);
@@ -753,132 +753,6 @@ class PodcastStudioApp {
 		if (this.dropboxTokenInput) {
 			this.dropboxTokenInput.value = "";
 		}
-	}
-
-	async handleDiskFolderSelection({ autoEnable = false } = {}) {
-		if (!STUDIO_DISK_FEATURE_FLAG || !this.diskFolderButton) {
-			return;
-		}
-		if (typeof window.showDirectoryPicker !== "function") {
-			this.diskStatusNode.textContent = "Local disk recording requires Chrome, Edge, or Arc.";
-			this.diskStatusNode.dataset.state = "error";
-			return;
-		}
-		try {
-			this.diskFolderButton.disabled = true;
-			this.diskFolderButton.textContent = "…";
-			await chooseDiskRecordingDirectory();
-			const result = await verifyStoredDiskRecordingDirectory({ requestPermission: true });
-			if (!result.ok) {
-				throw new Error(result.message || "Failed");
-			}
-			if (autoEnable || isDiskRecordingEnabled()) {
-				setDiskRecordingEnabled(true);
-				this.diskRecordingEnabled = true;
-			}
-		} catch (error) {
-			console.warn("Disk folder selection failed", error);
-			this.diskStatusNode.textContent = error?.name === "AbortError" || /cancel/i.test(error?.message || "") ? "Cancelled" : error?.message || "Error";
-			this.diskStatusNode.dataset.state = "error";
-		} finally {
-			this.diskFolderButton.disabled = false;
-			this.updateDiskRecordingUI();
-		}
-	}
-
-	async handleDiskToggle() {
-		if (!STUDIO_DISK_FEATURE_FLAG || !this.diskToggleButton) {
-			return;
-		}
-		if (typeof window.showDirectoryPicker !== "function") {
-			this.diskStatusNode.textContent = "Browser lacks File System Access API support.";
-			this.diskStatusNode.dataset.state = "error";
-			return;
-		}
-		const meta = readDiskRecordingState();
-		if (!meta.folderName) {
-			await this.handleDiskFolderSelection({ autoEnable: true });
-			return;
-		}
-		const nextEnabled = !isDiskRecordingEnabled();
-		if (nextEnabled) {
-			const result = await verifyStoredDiskRecordingDirectory({ requestPermission: true });
-			if (!result.ok) {
-				this.diskStatusNode.textContent = result.message || "Unable to access the selected folder.";
-				this.diskStatusNode.dataset.state = "error";
-				setDiskRecordingEnabled(false);
-				this.diskRecordingEnabled = false;
-				this.updateDiskRecordingUI();
-				return;
-			}
-		}
-		const finalState = setDiskRecordingEnabled(nextEnabled);
-		this.diskRecordingEnabled = Boolean(finalState.enabled);
-		this.updateDiskRecordingUI();
-	}
-
-	updateDiskRecordingUI() {
-		if (!STUDIO_DISK_FEATURE_FLAG || !this.diskControls) {
-			return;
-		}
-		const diskSupported = typeof window.showDirectoryPicker === "function";
-		const meta = readDiskRecordingState();
-		const hasFolder = Boolean(meta.folderName);
-		const enabled = Boolean(meta.enabled && hasFolder);
-		this.diskRecordingEnabled = enabled;
-		if (this.diskToggleButton) {
-			this.diskToggleButton.disabled = !diskSupported;
-			this.diskToggleButton.dataset.state = enabled ? "enabled" : "disabled";
-			this.diskToggleButton.textContent = enabled ? "Armed ✓" : "Arm";
-			this.diskToggleButton.setAttribute("aria-pressed", enabled ? "true" : "false");
-		}
-		if (this.diskFolderButton) {
-			this.diskFolderButton.disabled = !diskSupported;
-			this.diskFolderButton.textContent = hasFolder ? "Change" : diskSupported ? "Folder" : "N/A";
-		}
-		if (this.diskStatusNode) {
-			if (!diskSupported) {
-				this.diskStatusNode.textContent = "Requires Chrome/Edge";
-				this.diskStatusNode.dataset.state = "error";
-			} else if (!hasFolder) {
-				this.diskStatusNode.textContent = "No folder selected";
-				this.diskStatusNode.dataset.state = "pending";
-			} else if (meta.lastError) {
-				this.diskStatusNode.textContent = `${meta.folderName} — error`;
-				this.diskStatusNode.dataset.state = "error";
-			} else {
-				this.diskStatusNode.textContent = `${meta.folderName} ✓`;
-				this.diskStatusNode.dataset.state = meta.lastVerifiedAt ? "ready" : "pending";
-			}
-		}
-		this.updateReadinessSummary();
-	}
-
-	async ensureDiskCaptureReadiness({ interactive = false } = {}) {
-		if (!STUDIO_DISK_FEATURE_FLAG || !this.diskRecordingEnabled) {
-			return { enabled: false, ready: false };
-		}
-		const result = await verifyStoredDiskRecordingDirectory({ requestPermission: interactive });
-		if (!result.ok) {
-			if (this.diskStatusNode) {
-				this.diskStatusNode.textContent = result.message || "Unable to access the selected folder.";
-				this.diskStatusNode.dataset.state = "error";
-			}
-			setDiskRecordingEnabled(false);
-			this.diskRecordingEnabled = false;
-			this.updateDiskRecordingUI();
-			return {
-				enabled: true,
-				ready: false,
-				error: new Error(result.message || "Folder unavailable")
-			};
-		}
-		return {
-			enabled: true,
-			ready: true,
-			folderName: result.folderName,
-			verifiedAt: Date.now()
-		};
 	}
 
 	async handleDriveLink() {
@@ -1255,35 +1129,7 @@ class PodcastStudioApp {
 		isoConfigList.append(dropboxRow, this.cloudLinkMessages.dropbox);
 
 		// Local Disk row
-		if (STUDIO_DISK_FEATURE_FLAG) {
-			const diskSupported = typeof window.showDirectoryPicker === "function";
-			const diskRow = createElement("div", "iso-config-row");
-			diskRow.append(createElement("div", "iso-config-row__label", { text: "Local Disk" }));
-			const diskActions = createElement("div", "iso-config-row__actions");
-			this.diskControls = diskActions;
-			this.diskToggleButton = createElement("button", "iso-config-row__button", {
-				type: "button",
-				text: "Arm",
-				title: "Arm/disarm recording ISO files to local disk."
-			});
-			this.diskToggleButton.addEventListener("click", () => this.handleDiskToggle());
-			this.diskFolderButton = createElement("button", "iso-config-row__button iso-config-row__button--secondary", {
-				type: "button",
-				text: diskSupported ? "Folder" : "N/A",
-				title: diskSupported ? "Choose the destination folder for disk recording." : "Local disk recording is not supported in this browser."
-			});
-			this.diskFolderButton.disabled = !diskSupported;
-			if (diskSupported) {
-				this.diskFolderButton.addEventListener("click", () => this.handleDiskFolderSelection());
-			}
-			this.diskStatusNode = createElement("span", "iso-config-row__status", {
-				text: diskSupported ? "No folder" : "Not supported"
-			});
-			diskActions.append(this.diskToggleButton, this.diskFolderButton, this.diskStatusNode);
-			diskRow.append(diskActions);
-			isoConfigList.append(diskRow);
-			this.updateDiskRecordingUI();
-		}
+		this.diskRecording.buildRow(isoConfigList);
 
 		this.icecastController.buildControls(isoConfigList);
 
@@ -2220,8 +2066,8 @@ class PodcastStudioApp {
 			this.recordTransitioning = true;
 			this.updateRecordingButtons();
 			let diskInfo = null;
-			if (STUDIO_DISK_FEATURE_FLAG && this.diskRecordingEnabled) {
-				diskInfo = await this.ensureDiskCaptureReadiness({ interactive: true });
+			if (STUDIO_DISK_FEATURE_FLAG && this.diskRecording.enabled) {
+				diskInfo = await this.diskRecording.ensureCaptureReadiness({ interactive: true });
 				if (diskInfo && diskInfo.error) {
 					this.setStatusMessage(diskInfo.error.message || "Disk folder not accessible.");
 					this.recordTransitioning = false;
@@ -2558,18 +2404,10 @@ class PodcastStudioApp {
 		return status || "unknown";
 	}
 
-	isDiskDestinationReady() {
-		if (!STUDIO_DISK_FEATURE_FLAG) {
-			return false;
-		}
-		const meta = readDiskRecordingState();
-		return Boolean(meta.enabled && meta.folderName);
-	}
-
 	createServiceStatusLine(service) {
 		const line = createElement("div", "upload-status-line");
 		line.dataset.service = service;
-		const ready = service === "drive" ? this.cloud?.hasDriveAccess() : service === "dropbox" ? this.cloud?.hasDropboxAccess() : service === "local" ? this.isDiskDestinationReady() : false;
+		const ready = service === "drive" ? this.cloud?.hasDriveAccess() : service === "dropbox" ? this.cloud?.hasDropboxAccess() : service === "local" ? this.diskRecording.isDestinationReady() : false;
 		const hint = ready ? (service === "local" ? "armed" : "ready") : service === "local" ? "not armed" : "link to upload";
 		line.textContent = `${this.describeService(service)}: ${hint}`;
 		if (service === "local") {
@@ -2605,17 +2443,6 @@ class PodcastStudioApp {
 		}
 	}
 
-	sanitizeDiskFilename(filename, fallbackExt = "wav") {
-		const fallback = `podcast-track-${Date.now()}.${fallbackExt}`;
-		const input = (filename || fallback).toString();
-		const safe = input
-			.replace(/[\\/:*?"<>|]+/g, "-")
-			.replace(/\s+/g, "_")
-			.replace(/_+/g, "_")
-			.replace(/^-+|-+$/g, "");
-		return safe || fallback;
-	}
-
 	async saveBlobToArmedDisk(blob, filename) {
 		if (!blob) {
 			throw new Error("No recording blob available for disk write.");
@@ -2629,7 +2456,7 @@ class PodcastStudioApp {
 			throw new Error("No local disk folder is selected.");
 		}
 		const guessedExt = blob.type && blob.type.includes("/") ? (blob.type.split("/")[1] || "bin").split(";")[0] : "bin";
-		const safeFilename = this.sanitizeDiskFilename(filename, guessedExt);
+		const safeFilename = this.diskRecording.sanitizeFilename(filename, guessedExt);
 		const fileHandle = await directoryHandle.getFileHandle(safeFilename, { create: true });
 		const writable = await fileHandle.createWritable();
 		try {
@@ -2659,7 +2486,7 @@ class PodcastStudioApp {
 			localElement.textContent = "Local disk: missing file data";
 			return { status: "error", service: "local", error: new Error("Missing recording blob") };
 		}
-		if (!this.isDiskDestinationReady()) {
+		if (!this.diskRecording.isDestinationReady()) {
 			localElement.dataset.status = "skipped";
 			localElement.textContent = "Local folder: not configured (download only)";
 			return { status: "skipped", service: "local", reason: "not-armed" };
@@ -2761,6 +2588,7 @@ class PodcastStudioApp {
 		this.remoteControls.dispose();
 		this.help.dispose();
 		this.uploadProgress.dispose();
+		this.diskRecording.dispose();
 		this.stopRecordingStatusTimer();
 		if (this.diskStateListener) {
 			window.removeEventListener(PODCAST_DISK_EVENT, this.diskStateListener);
