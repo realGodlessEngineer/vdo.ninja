@@ -1,6 +1,6 @@
 import { waitForLegacySession, levelBus, LEVEL_EVENT, MultiTrackRecorder, CloudUploadCoordinator, bridgeLegacyMeters } from "../core/index.js";
 import { readDiskRecordingState, verifyStoredDiskRecordingDirectory, readDiskDirectoryHandle } from "./disk-recording-store.js?v=1";
-import { readCloudLinkStatus, isCloudLinkFresh, markCloudLinked, markCloudUnlinked } from "./cloud-link-store.js?v=1";
+import { readCloudLinkStatus } from "./cloud-link-store.js?v=1";
 import { readCaptureMode, writeCaptureMode } from "./capture-mode-store.js?v=1";
 import { readPreflightState, writePreflightState, isPreflightFresh } from "./preflight-store.js?v=1";
 import { IcecastController } from "./icecast-controller.js?v=1";
@@ -19,10 +19,9 @@ import { HelpModalController } from "./help-modal-controller.js?v=1";
 import { UploadProgressController } from "./upload-progress-controller.js?v=1";
 import { DiskRecordingController } from "./disk-recording-controller.js?v=1";
 import { InviteLinkController } from "./invite-link-controller.js?v=1";
+import { CloudLinkController } from "./cloud-link-controller.js?v=1";
 
 const STUDIO_ROOT_ID = "podcast-root";
-const DROPBOX_GUIDE_URL = "/cloud.html#dropbox";
-const PODCAST_CLOUD_EVENT = "podcast-cloud-status";
 const PODCAST_DISK_EVENT = "podcast-disk-state";
 const PODCAST_RECORD_PLAN_EVENT = "podcast-record-plan";
 const PODCAST_RECORD_STATUS_EVENT = "podcast-record-status";
@@ -320,29 +319,14 @@ class PodcastStudioApp {
 		this.inviteLink = new InviteLinkController({
 			getRoomName: () => this.resolveRoomName()
 		});
-		this.cloudBusy = {
-			drive: false,
-			dropbox: false
-		};
-		this.cloudLinkButtons = {
-			drive: null,
-			dropbox: null
-		};
-		this.cloudLinkStatusNodes = {
-			drive: null,
-			dropbox: null
-		};
-		this.cloudLinkMessages = {
-			drive: null,
-			dropbox: null
-		};
-		this.cloudLinkMessageTextNodes = {
-			drive: null,
-			dropbox: null
-		};
-		this.dropboxTokenInput = null;
-		this.dropboxTokenRow = null;
-		this.dropboxGuideRow = null;
+		this.cloudLink = new CloudLinkController({
+			getCloud: () => this.cloud,
+			isRecording: () => this.recording,
+			getDriveFolderName: () => this.session?.GDRIVE_FOLDERNAME || null,
+			onStatusChange: () => this.updateReadinessSummary(),
+			refreshCloudFooter: () => this.updateCloudFooter(),
+			refreshGuestBackupControls: () => this.guestBackup.updateAllActions()
+		});
 		this.chatModule = null;
 		this.chatPlaceholder = null;
 		this.chatPanel = null;
@@ -352,7 +336,6 @@ class PodcastStudioApp {
 		this.chatPopoutAnchor = null;
 		this.chatCollapsedHint = null;
 		this.diskStateListener = null;
-		this.cloudStateListener = null;
 		this.cloudSummaryNode = null;
 		this.captureSummaryNode = null;
 		this.backupSummaryNode = null;
@@ -410,8 +393,6 @@ class PodcastStudioApp {
 			};
 			window.addEventListener(PODCAST_DISK_EVENT, this.diskStateListener);
 		}
-		this.cloudStateListener = () => this.updateReadinessSummary();
-		window.addEventListener(PODCAST_CLOUD_EVENT, this.cloudStateListener);
 		this.updateRoomIndicator();
 		this.updateCloudFooter();
 		this.attachRecorderEvents();
@@ -510,174 +491,6 @@ class PodcastStudioApp {
 			} catch (error) {
 				console.warn("Failed to resume audio context", error);
 			}
-		}
-	}
-
-	setCloudMessage(service, message, variant = "info") {
-		const container = this.cloudLinkMessages?.[service];
-		if (!container) {
-			return;
-		}
-		const target = this.cloudLinkMessageTextNodes?.[service] || container;
-		target.textContent = message || "";
-		container.dataset.variant = message ? variant : "";
-	}
-
-	updateCloudLinkUI() {
-		const driveLinked = this.cloud?.hasDriveAccess();
-		const dropboxLinked = this.cloud?.hasDropboxAccess();
-		const cachedState = readCloudLinkStatus();
-		if (!driveLinked && cachedState.drive && !isCloudLinkFresh(cachedState.drive)) {
-			markCloudUnlinked("drive");
-		}
-		if (!dropboxLinked && cachedState.dropbox && !isCloudLinkFresh(cachedState.dropbox)) {
-			markCloudUnlinked("dropbox");
-		}
-
-		if (this.cloudLinkButtons.drive) {
-			this.cloudLinkButtons.drive.textContent = driveLinked ? "Reconnect Drive" : "Connect";
-			this.cloudLinkButtons.drive.disabled = Boolean(this.cloudBusy.drive) || this.recording;
-			this.cloudLinkButtons.drive.dataset.state = driveLinked ? "linked" : "idle";
-		}
-		if (this.cloudLinkStatusNodes.drive) {
-			this.cloudLinkStatusNodes.drive.textContent = driveLinked ? "Connected — guests upload directly" : "Not connected";
-			this.cloudLinkStatusNodes.drive.dataset.state = driveLinked ? "linked" : "idle";
-		}
-
-		if (this.cloudLinkButtons.dropbox) {
-			this.cloudLinkButtons.dropbox.textContent = dropboxLinked ? "Reconnect Dropbox" : "Connect";
-			this.cloudLinkButtons.dropbox.disabled = Boolean(this.cloudBusy.dropbox) || this.recording;
-			this.cloudLinkButtons.dropbox.dataset.state = dropboxLinked ? "linked" : "idle";
-		}
-		if (this.cloudLinkStatusNodes.dropbox) {
-			this.cloudLinkStatusNodes.dropbox.textContent = dropboxLinked ? "Connected — uploads after recording" : "Not connected";
-			this.cloudLinkStatusNodes.dropbox.dataset.state = dropboxLinked ? "linked" : "idle";
-		}
-		if (this.dropboxTokenInput) {
-			this.dropboxTokenInput.disabled = Boolean(this.cloudBusy.dropbox) || this.recording;
-		}
-		this.guestBackup.updateAllActions();
-	}
-
-	ensureDropboxTokenFallbackVisible({ focus = false, select = false } = {}) {
-		if (this.dropboxTokenRow) {
-			this.dropboxTokenRow.hidden = false;
-			this.dropboxTokenRow.classList.add("cloud-sync-token--visible");
-		}
-		if (this.dropboxGuideRow) {
-			this.dropboxGuideRow.hidden = false;
-			this.dropboxGuideRow.classList.add("cloud-sync-token__guide--visible");
-		}
-		if (focus && this.dropboxTokenInput) {
-			this.dropboxTokenInput.focus();
-			if (select && typeof this.dropboxTokenInput.select === "function") {
-				this.dropboxTokenInput.select();
-			}
-		}
-	}
-
-	hideDropboxTokenFallback() {
-		if (this.dropboxTokenRow) {
-			this.dropboxTokenRow.hidden = true;
-			this.dropboxTokenRow.classList.remove("cloud-sync-token--visible");
-		}
-		if (this.dropboxGuideRow) {
-			this.dropboxGuideRow.hidden = true;
-			this.dropboxGuideRow.classList.remove("cloud-sync-token__guide--visible");
-		}
-		if (this.dropboxTokenInput) {
-			this.dropboxTokenInput.value = "";
-		}
-	}
-
-	async handleDriveLink() {
-		if (!this.cloud || this.cloudBusy.drive) {
-			return;
-		}
-		this.cloudBusy.drive = true;
-		this.updateCloudLinkUI();
-		this.setCloudMessage("drive", "Requesting Google authorization…", "info");
-		try {
-			const client = this.cloud.ensureDriveClient();
-			if (!client) {
-				throw new Error("Google Drive integration is not available on this build.");
-			}
-			if (typeof client.ensureInitialized === "function") {
-				await client.ensureInitialized();
-			}
-			if (typeof client.requestAccessToken === "function") {
-				client.requestAccessToken();
-			}
-			if (client.promise && typeof client.promise.then === "function") {
-				await client.promise;
-			} else {
-				await new Promise(resolve => setTimeout(resolve, 800));
-			}
-			if (this.cloud.hasDriveAccess()) {
-				this.setCloudMessage("drive", "Google Drive connected. Guests can now record directly to Drive.", "success");
-				const folder = this.session?.GDRIVE_FOLDERNAME || null;
-				markCloudLinked("drive", { folder });
-			} else {
-				this.setCloudMessage("drive", "Check your popup blocker or try again.", "warn");
-				markCloudUnlinked("drive");
-			}
-		} catch (error) {
-			console.error("Failed to link Google Drive", error);
-			this.setCloudMessage("drive", error?.message || "Failed to link Google Drive.", "error");
-			markCloudUnlinked("drive");
-		} finally {
-			this.cloudBusy.drive = false;
-			this.updateCloudFooter();
-		}
-	}
-
-	async handleDropboxLink() {
-		if (!this.cloud || this.cloudBusy.dropbox) {
-			return;
-		}
-		this.cloudBusy.dropbox = true;
-		this.updateCloudLinkUI();
-		const providedToken = (this.dropboxTokenInput?.value || "").trim();
-		if (providedToken) {
-			this.ensureDropboxTokenFallbackVisible();
-		}
-		const interactive = !providedToken;
-		const hasExistingAccess = this.cloud?.hasDropboxAccess();
-		const forceReauth = !providedToken && hasExistingAccess;
-		const pendingMessage = providedToken ? "Linking Dropbox with the provided token…" : hasExistingAccess ? "Refreshing Dropbox session…" : "Waiting for the Dropbox popup to complete…";
-		this.setCloudMessage("dropbox", pendingMessage, "info");
-		try {
-			if (typeof window.setupDropbox !== "function") {
-				throw new Error("Dropbox uploader is not available in this build.");
-			}
-			const client = await this.cloud.ensureDropboxClient(providedToken || undefined, { interactive, forceReauth });
-			if (client) {
-				this.setCloudMessage("dropbox", "Dropbox linked. Recordings will upload automatically.", "success");
-				if (this.dropboxTokenInput) {
-					this.dropboxTokenInput.value = "";
-				}
-				if (!providedToken) {
-					this.hideDropboxTokenFallback();
-				}
-				markCloudLinked("dropbox");
-			} else {
-				markCloudUnlinked("dropbox");
-				if (providedToken) {
-					this.setCloudMessage("dropbox", "Dropbox rejected the provided token. Double-check and try again.", "error");
-					this.ensureDropboxTokenFallbackVisible({ focus: true, select: true });
-				} else {
-					this.setCloudMessage("dropbox", "Dropbox authorization was cancelled. Check your popup blocker and try again.", "warn");
-					this.ensureDropboxTokenFallbackVisible({ focus: true });
-				}
-			}
-		} catch (error) {
-			console.error("Failed to init Dropbox", error);
-			this.setCloudMessage("dropbox", error?.message || "Unable to initialise Dropbox.", "error");
-			this.ensureDropboxTokenFallbackVisible({ focus: true });
-			markCloudUnlinked("dropbox");
-		} finally {
-			this.cloudBusy.dropbox = false;
-			this.updateCloudFooter();
 		}
 	}
 
@@ -854,68 +667,8 @@ class PodcastStudioApp {
 
 		isoConfigList.append(this.guestBackup.buildRow());
 
-		// Google Drive row
-		const driveRow = createElement("div", "iso-config-row");
-		driveRow.append(createElement("div", "iso-config-row__label", { text: "Google Drive" }));
-		const driveActions = createElement("div", "iso-config-row__actions");
-		this.cloudLinkButtons.drive = createElement("button", "iso-config-row__button", { type: "button", text: "Connect", title: "Connect Google Drive to upload recordings automatically after each session." });
-		this.cloudLinkButtons.drive.addEventListener("click", () => this.handleDriveLink());
-		this.cloudLinkButtons.drive.dataset.state = "idle";
-		this.cloudLinkStatusNodes.drive = createElement("span", "iso-config-row__status", { text: "Not connected" });
-		this.cloudLinkStatusNodes.drive.dataset.state = "idle";
-		driveActions.append(this.cloudLinkButtons.drive, this.cloudLinkStatusNodes.drive);
-		driveRow.append(driveActions);
-		this.cloudLinkMessages.drive = createElement("div", "iso-config-row__hint");
-		this.cloudLinkMessages.drive.dataset.variant = "";
-		const driveMessageText = createElement("span", "iso-config-row__hint-text");
-		this.cloudLinkMessages.drive.append(driveMessageText);
-		this.cloudLinkMessageTextNodes.drive = driveMessageText;
-		isoConfigList.append(driveRow, this.cloudLinkMessages.drive);
-
-		// Dropbox row
-		const dropboxRow = createElement("div", "iso-config-row");
-		dropboxRow.append(createElement("div", "iso-config-row__label", { text: "Dropbox" }));
-		const dropboxActions = createElement("div", "iso-config-row__actions");
-		this.cloudLinkButtons.dropbox = createElement("button", "iso-config-row__button", { type: "button", text: "Connect", title: "Connect Dropbox to upload recordings automatically after each session." });
-		this.cloudLinkButtons.dropbox.addEventListener("click", () => this.handleDropboxLink());
-		this.cloudLinkButtons.dropbox.dataset.state = "idle";
-		this.cloudLinkStatusNodes.dropbox = createElement("span", "iso-config-row__status", { text: "Not connected" });
-		this.cloudLinkStatusNodes.dropbox.dataset.state = "idle";
-		dropboxActions.append(this.cloudLinkButtons.dropbox, this.cloudLinkStatusNodes.dropbox);
-		dropboxRow.append(dropboxActions);
-		this.cloudLinkMessages.dropbox = createElement("div", "iso-config-row__hint");
-		this.cloudLinkMessages.dropbox.dataset.variant = "";
-		const dropboxMessageText = createElement("span", "iso-config-row__hint-text");
-		this.cloudLinkMessages.dropbox.append(dropboxMessageText);
-		this.cloudLinkMessageTextNodes.dropbox = dropboxMessageText;
-		const tokenFieldId = "podcast-dropbox-token";
-		const dropboxTokenRow = createElement("div", "cloud-sync-token");
-		this.dropboxTokenRow = dropboxTokenRow;
-		const tokenLabel = createElement("label", "cloud-sync-token__label", { text: "Access token" });
-		tokenLabel.setAttribute("for", tokenFieldId);
-		this.dropboxTokenInput = createElement("input", "cloud-sync-token__input", {
-			type: "password",
-			placeholder: "Paste Dropbox personal access token",
-			id: tokenFieldId,
-			spellcheck: "false",
-			autocapitalize: "none",
-			autocomplete: "off",
-			title: "Fallback: paste a Dropbox token if the Link popup is unavailable."
-		});
-		dropboxTokenRow.append(tokenLabel, this.dropboxTokenInput);
-		const dropboxGuideRow = createElement("div", "cloud-sync-token__guide");
-		this.dropboxGuideRow = dropboxGuideRow;
-		const guideLink = createElement("a", "cloud-sync-guide-link", {
-			text: "Open the Dropbox setup guide",
-			href: DROPBOX_GUIDE_URL,
-			target: "_blank",
-			rel: "noopener",
-			title: "Open the Dropbox setup guide in a new tab."
-		});
-		dropboxGuideRow.append("Need a token? ", guideLink);
-		this.cloudLinkMessages.dropbox.append(dropboxTokenRow, dropboxGuideRow);
-		this.hideDropboxTokenFallback();
-		isoConfigList.append(dropboxRow, this.cloudLinkMessages.dropbox);
+		// Cloud upload links (Google Drive / Dropbox)
+		isoConfigList.append(this.cloudLink.buildPanel());
 
 		// Local Disk row
 		this.diskRecording.buildRow(isoConfigList);
@@ -1065,10 +818,10 @@ class PodcastStudioApp {
 		this.dropboxStatusNode = document.getElementById("podcast-cloud-dropbox");
 		this.hostMicController.updateUI();
 		this.hostMicController.setError("");
-		this.updateCloudLinkUI();
+		this.cloudLink.refresh();
 		this.updateReadinessSummary();
-		this.setCloudMessage("drive", "");
-		this.setCloudMessage("dropbox", "");
+		this.cloudLink.setCloudMessage("drive", "");
+		this.cloudLink.setCloudMessage("dropbox", "");
 		this.inviteLink.refresh();
 		this.toggleChatPanel(false);
 		requestAnimationFrame(() => this.toggleChatPanel(false));
@@ -2034,7 +1787,7 @@ class PodcastStudioApp {
 			this.dropboxStatusNode.textContent = dropboxText;
 		}
 		this.uploadProgress.refresh("dropbox");
-		this.updateCloudLinkUI();
+		this.cloudLink.refresh();
 		this.updateReadinessSummary();
 	}
 
@@ -2379,14 +2132,11 @@ class PodcastStudioApp {
 		this.uploadProgress.dispose();
 		this.diskRecording.dispose();
 		this.inviteLink?.dispose();
+		this.cloudLink?.dispose();
 		this.stopRecordingStatusTimer();
 		if (this.diskStateListener) {
 			window.removeEventListener(PODCAST_DISK_EVENT, this.diskStateListener);
 			this.diskStateListener = null;
-		}
-		if (this.cloudStateListener) {
-			window.removeEventListener(PODCAST_CLOUD_EVENT, this.cloudStateListener);
-			this.cloudStateListener = null;
 		}
 		if (this.levelOff) {
 			this.levelOff();
