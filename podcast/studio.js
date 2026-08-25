@@ -1,7 +1,6 @@
 import { waitForLegacySession, levelBus, LEVEL_EVENT, MultiTrackRecorder, CloudUploadCoordinator, bridgeLegacyMeters } from "../core/index.js";
 import { readDiskRecordingState, verifyStoredDiskRecordingDirectory, readDiskDirectoryHandle } from "./disk-recording-store.js?v=1";
 import { readCloudLinkStatus } from "./cloud-link-store.js?v=1";
-import { readCaptureMode, writeCaptureMode } from "./capture-mode-store.js?v=1";
 import { readPreflightState, writePreflightState, isPreflightFresh } from "./preflight-store.js?v=1";
 import { IcecastController } from "./icecast-controller.js?v=1";
 import { ROOM_QUERY_KEYS, DIRECTOR_QUERY_KEYS, sanitizeRoomSlug, getRoomSlugFromParams, readStoredRoomState, persistStoredRoomState } from "./room-state-store.js?v=1";
@@ -20,6 +19,7 @@ import { UploadProgressController } from "./upload-progress-controller.js?v=1";
 import { DiskRecordingController } from "./disk-recording-controller.js?v=1";
 import { InviteLinkController } from "./invite-link-controller.js?v=1";
 import { CloudLinkController } from "./cloud-link-controller.js?v=1";
+import { CaptureModeController } from "./capture-mode-controller.js?v=1";
 
 const STUDIO_ROOT_ID = "podcast-root";
 const PODCAST_DISK_EVENT = "podcast-disk-state";
@@ -327,6 +327,12 @@ class PodcastStudioApp {
 			refreshCloudFooter: () => this.updateCloudFooter(),
 			refreshGuestBackupControls: () => this.guestBackup.updateAllActions()
 		});
+		this.captureMode = new CaptureModeController({
+			onModeChange: () => {
+				this.updateRecordingButtons();
+				this.updateReadinessSummary();
+			}
+		});
 		this.chatModule = null;
 		this.chatPlaceholder = null;
 		this.chatPanel = null;
@@ -344,7 +350,6 @@ class PodcastStudioApp {
 		this.recordingSummary = null;
 		this.destinationLights = { download: null, drive: null, dropbox: null, disk: null };
 		this.isoSummary = null;
-		this.captureModeSelect = null;
 		this.recordingStatusNode = null;
 		this.recordingStatusTimer = null;
 		this.recordingStatusBase = "Idle";
@@ -352,7 +357,6 @@ class PodcastStudioApp {
 		this.recordTransitioning = false;
 		this.recordingPlan = null;
 		this.recordingSessionId = null;
-		this.currentRecordingMode = readCaptureMode();
 		this.icecastController = null;
 	}
 
@@ -604,15 +608,7 @@ class PodcastStudioApp {
 		this.markerButton = createElement("button", "btn-secondary", { type: "button", text: "Marker", title: "Drop a cue marker at the current time." });
 		this.markerButton.disabled = true;
 		this.markerButton.addEventListener("click", () => this.markerLog.addManual());
-		const captureSelectId = "podcast-capture-mode";
-		const captureModeLabel = createElement("label", "capture-mode-label", { text: "Capture" });
-		captureModeLabel.setAttribute("for", captureSelectId);
-		this.captureModeSelect = createElement("select", "capture-mode-select", { id: captureSelectId });
-		this.captureModeSelect.append(new Option("Audio only", "audio"), new Option("Audio + Video", "video"));
-		this.captureModeSelect.value = this.currentRecordingMode === "video" ? "video" : "audio";
-		this.captureModeSelect.addEventListener("change", () => this.handleCaptureModeChange(this.captureModeSelect.value));
-		const captureWrap = createElement("div", "capture-mode-wrap");
-		captureWrap.append(captureModeLabel, this.captureModeSelect);
+		const captureWrap = this.captureMode.buildControl();
 		transportButtons.append(captureWrap, this.recordButton);
 		transportButtons.append(this.markerButton);
 
@@ -877,30 +873,8 @@ class PodcastStudioApp {
 		}
 	}
 
-	getRecordingModeOptions(mode = this.currentRecordingMode) {
-		const videoMode = mode === "video";
-		return {
-			includeVideo: videoMode,
-			includeScreenshares: videoMode
-		};
-	}
-
-	handleCaptureModeChange(mode) {
-		const normalized = writeCaptureMode(mode);
-		this.currentRecordingMode = normalized;
-		if (this.captureModeSelect && this.captureModeSelect.value !== normalized) {
-			this.captureModeSelect.value = normalized;
-		}
-		this.updateRecordingButtons();
-		this.updateReadinessSummary();
-	}
-
 	getBackupParticipants() {
 		return collectParticipants(this.session).filter(participant => participant?.uuid);
-	}
-
-	describeCaptureMode(mode = this.currentRecordingMode) {
-		return mode === "video" ? "Audio + Video ISO" : "Audio ISO";
 	}
 
 	describeSaveTargetSummary() {
@@ -924,7 +898,7 @@ class PodcastStudioApp {
 	}
 
 	countEstimatedRecordingTracks() {
-		const recordingOptions = this.getRecordingModeOptions(this.currentRecordingMode);
+		const recordingOptions = this.captureMode.getRecordingModeOptions(this.captureMode.getMode());
 		let count = 0;
 		this.getBackupParticipants().forEach(participant => {
 			const stream = this.session?.rpcs?.[participant.uuid]?.streamSrc;
@@ -979,11 +953,9 @@ class PodcastStudioApp {
 			this.recordButton.classList.toggle("recording", this.recording);
 			this.recordButton.disabled = this.recordTransitioning;
 			this.recordButton.textContent = this.recording ? "Stop Recording" : "Start Recording";
-			this.recordButton.title = this.recording ? "Stop the current ISO recording." : `Start ${this.describeCaptureMode(this.currentRecordingMode)} capture.`;
+			this.recordButton.title = this.recording ? "Stop the current ISO recording." : `Start ${this.captureMode.describeCaptureMode(this.captureMode.getMode())} capture.`;
 		}
-		if (this.captureModeSelect) {
-			this.captureModeSelect.disabled = this.recording;
-		}
+		this.captureMode.setRecording(this.recording);
 		this.guestBackup.updateControls();
 	}
 
@@ -1014,9 +986,9 @@ class PodcastStudioApp {
 					highRes: snapshotHighResClock()
 				};
 			}
-			this.logRecordingEvent("record:start", { sessionId: this.recordingSessionId, mode: this.currentRecordingMode });
+			this.logRecordingEvent("record:start", { sessionId: this.recordingSessionId, mode: this.captureMode.getMode() });
 			this.updateRecordingPlanStatus("started", { events: this.recordingPlan?.events || [] });
-			this.setRecordingStatus(this.currentRecordingMode === "video" ? "Recording audio + video ISOs" : "Recording audio ISOs", "active");
+			this.setRecordingStatus(this.captureMode.getMode() === "video" ? "Recording audio + video ISOs" : "Recording audio ISOs", "active");
 			if (this.recordingSummary) this.recordingSummary.style.display = "";
 			this.startRecordingStatusTimer();
 		});
@@ -1114,7 +1086,7 @@ class PodcastStudioApp {
 				this.recordingPlan.files = this.summariseRecordingFiles(event.detail?.files);
 				this.logRecordingEvent("record:stop", {
 					fileCount: this.recordingPlan?.files?.length || 0,
-					mode: this.currentRecordingMode
+					mode: this.captureMode.getMode()
 				});
 				this.updateRecordingPlanStatus("stopped", {
 					files: this.recordingPlan.files,
@@ -1422,9 +1394,9 @@ class PodcastStudioApp {
 				stop: null
 			},
 			capture: {
-				mode: this.currentRecordingMode,
-				includeVideo: this.currentRecordingMode === "video",
-				includeScreenshares: this.currentRecordingMode === "video"
+				mode: this.captureMode.getMode(),
+				includeVideo: this.captureMode.getMode() === "video",
+				includeScreenshares: this.captureMode.getMode() === "video"
 			},
 			participants: {},
 			files: [],
@@ -1618,10 +1590,10 @@ class PodcastStudioApp {
 				}
 			}
 			this.buildRecordingPlanContext({ diskInfo });
-			this.logRecordingEvent("record:arm", { source: "host-toggle", mode: this.currentRecordingMode });
+			this.logRecordingEvent("record:arm", { source: "host-toggle", mode: this.captureMode.getMode() });
 			this.updateRecordingPlanStatus("armed", { events: this.recordingPlan?.events || [] });
-			this.setRecordingStatus(this.currentRecordingMode === "video" ? "Arming audio + video ISOs…" : "Arming audio ISOs…", "arming");
-			const recordingOptions = this.getRecordingModeOptions(this.currentRecordingMode);
+			this.setRecordingStatus(this.captureMode.getMode() === "video" ? "Arming audio + video ISOs…" : "Arming audio ISOs…", "arming");
+			const recordingOptions = this.captureMode.getRecordingModeOptions(this.captureMode.getMode());
 			await this.recorder.start({
 				includeVideo: recordingOptions.includeVideo,
 				includeScreenshares: recordingOptions.includeScreenshares,
@@ -1804,7 +1776,7 @@ class PodcastStudioApp {
 		this.updateDestinationLights(driveActive, dropboxActive, diskReady, diskMeta, guestBackup);
 
 		if (this.captureSummaryNode) {
-			this.captureSummaryNode.textContent = `Capture: ${this.describeCaptureMode(this.currentRecordingMode)}`;
+			this.captureSummaryNode.textContent = `Capture: ${this.captureMode.describeCaptureMode(this.captureMode.getMode())}`;
 		}
 		if (this.backupSummaryNode) {
 			if (!guestBackup.total) {
@@ -2133,6 +2105,7 @@ class PodcastStudioApp {
 		this.diskRecording.dispose();
 		this.inviteLink?.dispose();
 		this.cloudLink?.dispose();
+		this.captureMode?.dispose();
 		this.stopRecordingStatusTimer();
 		if (this.diskStateListener) {
 			window.removeEventListener(PODCAST_DISK_EVENT, this.diskStateListener);
