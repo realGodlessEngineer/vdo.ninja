@@ -4,7 +4,6 @@ import { readCloudLinkStatus } from "./cloud-link-store.js?v=1";
 import { readPreflightState, writePreflightState, isPreflightFresh } from "./preflight-store.js?v=1";
 import { IcecastController } from "./icecast-controller.js?v=1";
 import { ROOM_QUERY_KEYS, DIRECTOR_QUERY_KEYS, sanitizeRoomSlug, getRoomSlugFromParams, readStoredRoomState, persistStoredRoomState } from "./room-state-store.js?v=1";
-import { SpectrogramRenderer } from "./spectrogram-renderer.js?v=1";
 import { injectStylesheet, createElement, makeCollapsible } from "./dom-helpers.js?v=1";
 import { formatRelativeTime } from "./time-format.js?v=1";
 import { createRecordingSessionId, snapshotHighResClock } from "./recording-session-utils.js?v=1";
@@ -21,6 +20,7 @@ import { InviteLinkController } from "./invite-link-controller.js?v=1";
 import { CloudLinkController } from "./cloud-link-controller.js?v=1";
 import { CaptureModeController } from "./capture-mode-controller.js?v=1";
 import { PreflightController } from "./preflight-controller.js?v=1";
+import { TracklistController } from "./tracklist-controller.js?v=1";
 
 const STUDIO_ROOT_ID = "podcast-root";
 const PODCAST_DISK_EVENT = "podcast-disk-state";
@@ -250,11 +250,7 @@ class PodcastStudioApp {
 		this.recorder = null;
 		this.audioContext = null;
 		this.recording = false;
-		this.outputIndicators = new Map();
 		this.trackRuntimeStats = new Map();
-		this.trackLevelNodes = new Map();
-		this.spectrograms = new Map();
-		this.participantMetrics = new Map();
 		this.markerLog = null;
 		this.levelOff = null;
 		this.recordStartedAt = null;
@@ -295,7 +291,7 @@ class PodcastStudioApp {
 			teardownGuestBackupControl: uuid => this.guestBackup.teardownRosterControl(uuid),
 			updateGuestBackupAvailability: uuid => this.guestBackup.updateActionAvailability(uuid),
 			onOpenRemoteControls: uuid => this.remoteControls.open(uuid),
-			onParticipantSeen: participant => this.captureParticipantMetrics(participant),
+			onParticipantSeen: participant => this.tracklist.captureParticipantMetrics(participant),
 			onParticipantAdded: participant => this.tryAddParticipantToRecording(participant),
 			onParticipantRemoved: uuid => this.remoteControls.closeIfActive(uuid),
 			onBeforeRefresh: () => this.updateRoomIndicator(),
@@ -345,6 +341,10 @@ class PodcastStudioApp {
 			isLocalDiskDestinationReady: () => this.diskRecording.isDestinationReady(),
 			updateGuestBackupControls: () => this.guestBackup.updateControls(),
 			formatFileSize: bytes => this.formatFileSize(bytes)
+		});
+		this.tracklist = new TracklistController({
+			getTrackMeter: (uuid, trackType, channelIndex) => (this.recorder && typeof this.recorder.getTrackMeter === "function" ? this.recorder.getTrackMeter(uuid, trackType, channelIndex) : null),
+			formatBitrate: kbps => this.formatBitrate(kbps)
 		});
 		this.chatModule = null;
 		this.chatPlaceholder = null;
@@ -702,7 +702,8 @@ class PodcastStudioApp {
 		timelinePanel.classList.add("console-grid__span-2");
 		this.outputsContainer = createElement("div", "timeline-surface");
 		timelinePanel.append(this.outputsContainer);
-		this.showOutputsMessage("Recordings and cue points will appear here.");
+		this.tracklist.bindNodes({ outputsContainer: this.outputsContainer });
+		this.tracklist.showOutputsMessage("Recordings and cue points will appear here.");
 		makeCollapsible(timelinePanel, "Timeline & Outputs", "podcastStudio.collapse.timeline");
 
 		const chatPanel = createElement("section", "podcast-panel chat-panel");
@@ -920,7 +921,7 @@ class PodcastStudioApp {
 				count += stream?.getVideoTracks?.().length || 0;
 			}
 		});
-		return Math.max(count, this.outputIndicators?.size || 0);
+		return Math.max(count, this.tracklist.getIndicatorCount());
 	}
 
 	refreshRecordingStatusLive() {
@@ -971,9 +972,9 @@ class PodcastStudioApp {
 			this.abortUploadsController = new AbortController();
 			this.cleanupDownloadUrls();
 			this.trackRuntimeStats.clear();
-			this.trackLevelNodes.clear();
-			this.teardownSpectrograms();
-			this.outputIndicators.clear();
+			this.tracklist.clearTrackLevelNodes();
+			this.tracklist.teardownSpectrograms();
+			this.tracklist.clearOutputIndicators();
 			this.recording = true;
 			this.recordTransitioning = false;
 			this.recordStartedAt = event?.detail?.startedAt || Date.now();
@@ -981,7 +982,7 @@ class PodcastStudioApp {
 			this.markerLog.scheduleAutoSync();
 			this.updateRecordingButtons();
 			this.markerButton.disabled = false;
-			this.showOutputsMessage("Recording… tracks will appear as media arrives.");
+			this.tracklist.showOutputsMessage("Recording… tracks will appear as media arrives.");
 			this.hostMicController.updateUI();
 			this.uploadProgress.setPending(true);
 			if (this.recordingPlan?.sync) {
@@ -1003,11 +1004,11 @@ class PodcastStudioApp {
 				return;
 			}
 			const channelKey = typeof channelIndex === "number" ? channelIndex : 0;
-			const key = this.buildTrackKey(participant.uuid, trackType, channelKey);
+			const key = this.tracklist.buildTrackKey(participant.uuid, trackType, channelKey);
 			if (!key) {
 				return;
 			}
-			const indicator = this.ensureOutputIndicator(key, participant, trackType, channelKey);
+			const indicator = this.tracklist.ensureOutputIndicator(key, participant, trackType, channelKey);
 			if (!indicator) {
 				return;
 			}
@@ -1022,15 +1023,15 @@ class PodcastStudioApp {
 			if (!participant?.uuid || trackType !== "audio") {
 				return;
 			}
-			const key = this.buildTrackKey(participant.uuid, trackType, channelIndex);
+			const key = this.tracklist.buildTrackKey(participant.uuid, trackType, channelIndex);
 			if (!key) {
 				return;
 			}
-			const indicator = this.outputIndicators.get(key);
+			const indicator = this.tracklist.getIndicator(key);
 			if (!indicator) {
 				return;
 			}
-			this.attachSpectrogram(key, indicator, participant, trackType, channelIndex, meter);
+			this.tracklist.attachSpectrogram(key, indicator, participant, trackType, channelIndex, meter);
 		});
 
 		this.recorder.addEventListener("participant-added", event => {
@@ -1039,9 +1040,9 @@ class PodcastStudioApp {
 				return;
 			}
 			const annotateLateJoin = (trackType, trackIndex) => {
-				const key = this.buildTrackKey(participant.uuid, trackType, trackIndex);
+				const key = this.tracklist.buildTrackKey(participant.uuid, trackType, trackIndex);
 				if (key) {
-					const indicator = this.ensureOutputIndicator(key, participant, trackType, trackIndex);
+					const indicator = this.tracklist.ensureOutputIndicator(key, participant, trackType, trackIndex);
 					if (indicator?.badge) {
 						indicator.badge.textContent = "Late join";
 						indicator.badge.title = `Joined ${startOffsetSeconds?.toFixed(1) || "?"}s into recording`;
@@ -1073,11 +1074,11 @@ class PodcastStudioApp {
 			this.updateRecordingButtons();
 			this.markerButton.disabled = true;
 			this.markerLog.clearAutoTimer();
-			this.showOutputsMessage("Finalising recordings…");
-			this.trackLevelNodes.clear();
-			this.teardownSpectrograms();
+			this.tracklist.showOutputsMessage("Finalising recordings…");
+			this.tracklist.clearTrackLevelNodes();
+			this.tracklist.teardownSpectrograms();
 			this.presentRecordings(event.detail?.files);
-			this.outputIndicators.clear();
+			this.tracklist.clearOutputIndicators();
 			this.trackRuntimeStats.clear();
 			this.hostMicController.updateUI();
 			if (this.recordingPlan?.sync) {
@@ -1101,242 +1102,8 @@ class PodcastStudioApp {
 		});
 	}
 
-	ensureOutputIndicator(key, participant, trackType, channelIndex = 0) {
-		if (!this.outputsContainer) {
-			return null;
-		}
-		if (this.outputIndicators.has(key)) {
-			return this.outputIndicators.get(key);
-		}
-
-		this.prepareTracklistSurface();
-
-		if (!this.outputsContainer.dataset.hasTracks) {
-			this.outputsContainer.innerHTML = "";
-			this.outputsContainer.dataset.hasTracks = "true";
-		}
-
-		const wrapper = createElement("div", "timeline-track");
-		wrapper.dataset.key = key;
-		wrapper.dataset.trackType = trackType;
-		wrapper.dataset.participant = participant.uuid || "";
-		wrapper.dataset.state = "armed";
-
-		const header = createElement("div", "timeline-track__header");
-		const titleGroup = createElement("div", "timeline-track__title-group");
-		const title = createElement("div", "timeline-track__title", { text: participant.label || participant.uuid || "Guest" });
-		const descriptorParts = [];
-		if (participant.external || participant.uuid === "host-mic") {
-			descriptorParts.push("Local input");
-		} else if (participant.streamID) {
-			descriptorParts.push(`Stream ${participant.streamID}`);
-		}
-		descriptorParts.push(trackType ? trackType.toUpperCase() : "AUDIO");
-		descriptorParts.push(`Channel ${channelIndex + 1}`);
-		const subtitle = createElement("div", "timeline-track__subtitle", {
-			text: descriptorParts.filter(Boolean).join(" • ")
-		});
-		titleGroup.append(title, subtitle);
-		const badge = createElement("span", "timeline-track__badge", { text: "Arming" });
-		header.append(titleGroup, badge);
-
-		const metrics = createElement("div", "timeline-track__metrics");
-		const inboundMetric = createElement("span", "timeline-track__metric timeline-track__metric--inbound", {
-			text: trackType === "video" ? (participant.external || participant.uuid === "host-mic" ? "Inbound: Local capture" : "Inbound: Video track live") : participant.external || participant.uuid === "host-mic" ? "Inbound: Local capture" : "Inbound: pending…"
-		});
-		const recordMetric = createElement("span", "timeline-track__metric timeline-track__metric--recording", {
-			text: trackType === "video" ? "Recording: waiting for video…" : "Recording: waiting…"
-		});
-		metrics.append(inboundMetric, recordMetric);
-
-		const waveform = createElement("div", "timeline-track__waveform");
-		const spectrogramCanvas = document.createElement("canvas");
-		spectrogramCanvas.className = "timeline-track__spectrogram";
-		const waveFill = createElement("div", "timeline-track__wavefill");
-		waveform.append(spectrogramCanvas, waveFill);
-
-		wrapper.append(header, metrics, waveform);
-		this.outputsContainer.append(wrapper);
-
-		const indicator = {
-			key,
-			wrapper,
-			badge,
-			inboundMetric,
-			recordMetric,
-			waveFill,
-			spectrogramCanvas,
-			participant,
-			trackType,
-			channelIndex
-		};
-
-		this.outputIndicators.set(key, indicator);
-		this.registerTrackLevelNode(participant.uuid, waveFill);
-		this.updateTrackInboundMetric(participant.uuid);
-		this.attachSpectrogram(key, indicator, participant, trackType, channelIndex);
-		return indicator;
-	}
-
 	setStatusMessage(message) {
-		this.showOutputsMessage(message);
-	}
-
-	showOutputsMessage(text) {
-		if (!this.outputsContainer) {
-			return;
-		}
-		this.outputsContainer.dataset.mode = "message";
-		this.outputsContainer.dataset.hasTracks = "";
-		this.outputsContainer.classList.remove("timeline-tracklist");
-		this.outputsContainer.classList.remove("timeline-results");
-		this.outputsContainer.innerHTML = "";
-		if (typeof text === "string" && text.trim()) {
-			this.outputsContainer.append(createElement("div", "timeline-placeholder", { text }));
-		} else {
-			this.outputsContainer.append(createElement("div", "timeline-placeholder", { text: "" }));
-		}
-	}
-
-	prepareTracklistSurface({ reset = false } = {}) {
-		if (!this.outputsContainer) {
-			return;
-		}
-		const switchingMode = this.outputsContainer.dataset.mode !== "recording";
-		if (switchingMode || reset) {
-			this.outputsContainer.innerHTML = "";
-			this.outputsContainer.dataset.hasTracks = "";
-		}
-		this.outputsContainer.dataset.mode = "recording";
-		this.outputsContainer.classList.add("timeline-tracklist");
-		this.outputsContainer.classList.remove("timeline-results");
-	}
-
-	buildTrackKey(uuid, trackType, channelIndex = 0) {
-		if (!uuid || !trackType) {
-			return "";
-		}
-		const index = typeof channelIndex === "number" ? channelIndex : 0;
-		return `${uuid}-${trackType}-${index}`;
-	}
-
-	getMeterForTrack(uuid, trackType, channelIndex = 0) {
-		if (!this.recorder || typeof this.recorder.getTrackMeter !== "function") {
-			return null;
-		}
-		return this.recorder.getTrackMeter(uuid, trackType, channelIndex);
-	}
-
-	attachSpectrogram(key, indicator, participant, trackType, channelIndex, meterOverride = null) {
-		if (!key || trackType !== "audio" || !indicator?.spectrogramCanvas) {
-			return;
-		}
-		let renderer = this.spectrograms.get(key);
-		if (!renderer) {
-			renderer = new SpectrogramRenderer(indicator.spectrogramCanvas);
-			this.spectrograms.set(key, renderer);
-		}
-		if (!participant?.uuid) {
-			return;
-		}
-		const meter = meterOverride || this.getMeterForTrack(participant.uuid, trackType, channelIndex);
-		if (meter?.analyser) {
-			renderer.setAnalyser(meter.analyser);
-		}
-	}
-
-	teardownSpectrograms() {
-		if (!this.spectrograms) {
-			return;
-		}
-		this.spectrograms.forEach(renderer => {
-			if (renderer && typeof renderer.destroy === "function") {
-				renderer.destroy();
-			}
-		});
-		this.spectrograms.clear();
-	}
-
-	registerTrackLevelNode(uuid, node) {
-		if (!uuid || !node) {
-			return;
-		}
-		if (!this.trackLevelNodes.has(uuid)) {
-			this.trackLevelNodes.set(uuid, new Set());
-		}
-		this.trackLevelNodes.get(uuid).add(node);
-	}
-
-	updateTrackLevelVisual(uuid, level) {
-		if (!uuid) {
-			return;
-		}
-		const nodes = this.trackLevelNodes.get(uuid);
-		if (!nodes || !nodes.size) {
-			return;
-		}
-		const normalized = Math.max(0.08, Math.min(1, (level || 0) / 100));
-		nodes.forEach(node => {
-			if (!node) {
-				return;
-			}
-			node.style.transform = `scaleY(${normalized})`;
-			node.style.opacity = level > 3 ? "0.95" : "0.45";
-		});
-	}
-
-	captureParticipantMetrics(participant) {
-		if (!participant?.uuid) {
-			return;
-		}
-		const next = { ...(this.participantMetrics.get(participant.uuid) || {}) };
-		if (typeof participant.audioBitrateKbps === "number" && participant.audioBitrateKbps >= 0) {
-			next.audioBitrateKbps = participant.audioBitrateKbps;
-		}
-		if (participant.audioCodec) {
-			next.audioCodec = participant.audioCodec;
-		}
-		if (participant.external || participant.uuid === "host-mic") {
-			next.local = true;
-		}
-		this.participantMetrics.set(participant.uuid, next);
-		this.updateTrackInboundMetric(participant.uuid, next);
-	}
-
-	updateTrackInboundMetric(uuid, metrics = this.participantMetrics.get(uuid)) {
-		if (!uuid) {
-			return;
-		}
-		const resolvedMetrics = metrics || null;
-		const indicators = this.outputIndicators || new Map();
-		indicators.forEach(indicator => {
-			if (!indicator || !indicator.participant || indicator.participant.uuid !== uuid) {
-				return;
-			}
-			const node = indicator.inboundMetric;
-			if (!node) {
-				return;
-			}
-			if (resolvedMetrics?.local) {
-				node.textContent = indicator.trackType === "video" ? "Inbound: Local video capture" : "Inbound: Local capture";
-				return;
-			}
-			if (indicator.trackType === "video") {
-				node.textContent = "Inbound: Video track live";
-				return;
-			}
-			const parts = [];
-			if (resolvedMetrics && typeof resolvedMetrics.audioBitrateKbps === "number" && resolvedMetrics.audioBitrateKbps > 0) {
-				const formatted = this.formatBitrate(resolvedMetrics.audioBitrateKbps);
-				if (formatted) {
-					parts.push(formatted);
-				}
-			}
-			if (resolvedMetrics?.audioCodec) {
-				parts.push(resolvedMetrics.audioCodec.toUpperCase());
-			}
-			node.textContent = parts.length ? `Inbound: ${parts.join(" • ")}` : "Inbound: pending…";
-		});
+		this.tracklist.showOutputsMessage(message);
 	}
 
 	updateRecordingRuntimeMetrics(key, indicator, detail) {
@@ -1562,7 +1329,7 @@ class PodcastStudioApp {
 		if (this.recording) {
 			this.recordTransitioning = true;
 			this.updateRecordingButtons();
-			this.showOutputsMessage("Wrapping up recording…");
+			this.tracklist.showOutputsMessage("Wrapping up recording…");
 			this.logRecordingEvent("record:stop:requested", { reason: "host-toggle" });
 			this.setRecordingStatus("Stopping recording…", "stopping");
 			if (this.markerButton) {
@@ -1683,7 +1450,7 @@ class PodcastStudioApp {
 	async presentRecordings(filesMap) {
 		const files = filesMap || this.recorder.getFiles();
 		if (!files || files.size === 0) {
-			this.showOutputsMessage("No media captured.");
+			this.tracklist.showOutputsMessage("No media captured.");
 			this.uploadProgress.setPending(false);
 			return;
 		}
@@ -1750,7 +1517,7 @@ class PodcastStudioApp {
 		const peak = payload.peak || 0;
 		const level = Math.min(100, Math.round(peak * 120));
 		this.roster.applyMeterValue(payload.uuid, level);
-		this.updateTrackLevelVisual(payload.uuid, level);
+		this.tracklist.updateTrackLevelVisual(payload.uuid, level);
 	}
 
 	formatFileSize(bytes) {
@@ -1935,6 +1702,7 @@ class PodcastStudioApp {
 		this.cloudLink?.dispose();
 		this.captureMode?.dispose();
 		this.preflight?.dispose();
+		this.tracklist?.dispose();
 		this.stopRecordingStatusTimer();
 		if (this.diskStateListener) {
 			window.removeEventListener(PODCAST_DISK_EVENT, this.diskStateListener);
