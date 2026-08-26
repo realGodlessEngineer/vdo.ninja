@@ -20,6 +20,7 @@ import { DiskRecordingController } from "./disk-recording-controller.js?v=1";
 import { InviteLinkController } from "./invite-link-controller.js?v=1";
 import { CloudLinkController } from "./cloud-link-controller.js?v=1";
 import { CaptureModeController } from "./capture-mode-controller.js?v=1";
+import { PreflightController } from "./preflight-controller.js?v=1";
 
 const STUDIO_ROOT_ID = "podcast-root";
 const PODCAST_DISK_EVENT = "podcast-disk-state";
@@ -276,7 +277,7 @@ class PodcastStudioApp {
 		this.guestBackup = new GuestBackupController({
 			getParticipants: () => this.getBackupParticipants(),
 			hasDriveAccess: () => Boolean(this.cloud?.hasDriveAccess()),
-			onReadinessChange: () => this.updateReadinessSummary(),
+			onReadinessChange: () => this.preflight.updateReadinessSummary(),
 			onRecordingStatusChange: () => this.refreshRecordingStatusLive()
 		});
 		this.roster = new RosterController({
@@ -300,7 +301,7 @@ class PodcastStudioApp {
 			onBeforeRefresh: () => this.updateRoomIndicator(),
 			onAfterRefresh: () => {
 				this.guestBackup.updateControls();
-				this.updateReadinessSummary();
+				this.preflight.updateReadinessSummary();
 				this.refreshRecordingStatusLive();
 				this.icecastController.refreshSourcesIfLive();
 			}
@@ -310,11 +311,11 @@ class PodcastStudioApp {
 		});
 		this.help = new HelpModalController();
 		this.uploadProgress = new UploadProgressController({
-			describeService: service => this.describeService(service)
+			describeService: service => this.preflight.describeService(service)
 		});
 		this.diskRecording = new DiskRecordingController({
 			featureEnabled: STUDIO_DISK_FEATURE_FLAG,
-			onReadinessChange: () => this.updateReadinessSummary()
+			onReadinessChange: () => this.preflight.updateReadinessSummary()
 		});
 		this.inviteLink = new InviteLinkController({
 			getRoomName: () => this.resolveRoomName()
@@ -323,15 +324,27 @@ class PodcastStudioApp {
 			getCloud: () => this.cloud,
 			isRecording: () => this.recording,
 			getDriveFolderName: () => this.session?.GDRIVE_FOLDERNAME || null,
-			onStatusChange: () => this.updateReadinessSummary(),
-			refreshCloudFooter: () => this.updateCloudFooter(),
+			onStatusChange: () => this.preflight.updateReadinessSummary(),
+			refreshCloudFooter: () => this.preflight.updateCloudFooter(),
 			refreshGuestBackupControls: () => this.guestBackup.updateAllActions()
 		});
 		this.captureMode = new CaptureModeController({
 			onModeChange: () => {
 				this.updateRecordingButtons();
-				this.updateReadinessSummary();
+				this.preflight.updateReadinessSummary();
 			}
+		});
+		this.preflight = new PreflightController({
+			hasDriveAccess: () => Boolean(this.cloud?.hasDriveAccess()),
+			hasDropboxAccess: () => Boolean(this.cloud?.hasDropboxAccess()),
+			getGuestBackupSnapshot: () => this.guestBackup.getSnapshot(),
+			isIcecastLive: () => Boolean(this.icecastController?.isLive()),
+			describeCaptureMode: () => this.captureMode.describeCaptureMode(this.captureMode.getMode()),
+			refreshUploadProgress: () => this.uploadProgress.refresh("dropbox"),
+			refreshCloudLink: () => this.cloudLink.refresh(),
+			isLocalDiskDestinationReady: () => this.diskRecording.isDestinationReady(),
+			updateGuestBackupControls: () => this.guestBackup.updateControls(),
+			formatFileSize: bytes => this.formatFileSize(bytes)
 		});
 		this.chatModule = null;
 		this.chatPlaceholder = null;
@@ -381,24 +394,24 @@ class PodcastStudioApp {
 			getMixParticipants: () => this.getIcecastMixParticipants(),
 			formatFileSize: bytes => this.formatFileSize(bytes),
 			formatDuration: seconds => this.formatDuration(seconds),
-			onReadinessChange: () => this.updateReadinessSummary()
+			onReadinessChange: () => this.preflight.updateReadinessSummary()
 		});
 		this.cloud = new CloudUploadCoordinator(this.session);
 
 		this.roomName = this.resolveRoomName();
 		this.buildLayout();
 		this.icecastController.updateUI();
-		this.updateReadinessSummary();
+		this.preflight.updateReadinessSummary();
 		this.updateRecordingButtons();
 		if (STUDIO_DISK_FEATURE_FLAG) {
 			this.diskStateListener = () => {
 				this.diskRecording.updateUI();
-				this.updateReadinessSummary();
+				this.preflight.updateReadinessSummary();
 			};
 			window.addEventListener(PODCAST_DISK_EVENT, this.diskStateListener);
 		}
 		this.updateRoomIndicator();
-		this.updateCloudFooter();
+		this.preflight.updateCloudFooter();
 		this.attachRecorderEvents();
 		this.roster.refresh();
 		this.roster.startLoop();
@@ -812,10 +825,21 @@ class PodcastStudioApp {
 
 		this.driveStatusNode = document.getElementById("podcast-cloud-drive");
 		this.dropboxStatusNode = document.getElementById("podcast-cloud-dropbox");
+		this.preflight.bindNodes({
+			isoSummary: this.isoSummary,
+			cloudSummaryNode: this.cloudSummaryNode,
+			captureSummaryNode: this.captureSummaryNode,
+			backupSummaryNode: this.backupSummaryNode,
+			saveSummaryNode: this.saveSummaryNode,
+			summaryWarningNode: this.summaryWarningNode,
+			driveStatusNode: this.driveStatusNode,
+			dropboxStatusNode: this.dropboxStatusNode,
+			destinationLights: this.destinationLights
+		});
 		this.hostMicController.updateUI();
 		this.hostMicController.setError("");
 		this.cloudLink.refresh();
-		this.updateReadinessSummary();
+		this.preflight.updateReadinessSummary();
 		this.cloudLink.setCloudMessage("drive", "");
 		this.cloudLink.setCloudMessage("dropbox", "");
 		this.inviteLink.refresh();
@@ -875,26 +899,6 @@ class PodcastStudioApp {
 
 	getBackupParticipants() {
 		return collectParticipants(this.session).filter(participant => participant?.uuid);
-	}
-
-	describeSaveTargetSummary() {
-		const driveActive = Boolean(this.cloud?.hasDriveAccess());
-		const dropboxActive = Boolean(this.cloud?.hasDropboxAccess());
-		const diskMeta = readDiskRecordingState();
-		const saveTargets = [];
-		if (STUDIO_DISK_FEATURE_FLAG && diskMeta.enabled && diskMeta.folderName) {
-			saveTargets.push(`Local folder (${diskMeta.folderName})`);
-		}
-		if (driveActive) {
-			saveTargets.push("Drive");
-		}
-		if (dropboxActive) {
-			saveTargets.push("Dropbox");
-		}
-		if (!saveTargets.length) {
-			return "Browser buffer only";
-		}
-		return `After stop -> ${saveTargets.join(" + ")}`;
 	}
 
 	countEstimatedRecordingTracks() {
@@ -1715,8 +1719,8 @@ class PodcastStudioApp {
 			}
 			wrapper.append(metaLine);
 			const statusContainer = createElement("div", "upload-status");
-			const localLine = STUDIO_DISK_FEATURE_FLAG ? this.createServiceStatusLine("local") : null;
-			const dropboxLine = this.createServiceStatusLine("dropbox");
+			const localLine = STUDIO_DISK_FEATURE_FLAG ? this.preflight.createServiceStatusLine("local") : null;
+			const dropboxLine = this.preflight.createServiceStatusLine("dropbox");
 			if (localLine) {
 				statusContainer.append(localLine);
 			}
@@ -1736,7 +1740,7 @@ class PodcastStudioApp {
 				console.warn("One or more uploads failed", error);
 			}
 		}
-		this.updateCloudFooter();
+		this.preflight.updateCloudFooter();
 	}
 
 	updateMeterFromBus(payload) {
@@ -1747,122 +1751,6 @@ class PodcastStudioApp {
 		const level = Math.min(100, Math.round(peak * 120));
 		this.roster.applyMeterValue(payload.uuid, level);
 		this.updateTrackLevelVisual(payload.uuid, level);
-	}
-
-	updateCloudFooter() {
-		if (this.driveStatusNode) {
-			const driveText = this.cloud?.hasDriveAccess() ? "Google Drive linked" : "Drive link pending";
-			this.driveStatusNode.textContent = driveText;
-		}
-		if (this.dropboxStatusNode) {
-			const dropboxText = this.cloud?.hasDropboxAccess() ? "Dropbox linked" : "Dropbox link pending";
-			this.dropboxStatusNode.textContent = dropboxText;
-		}
-		this.uploadProgress.refresh("dropbox");
-		this.cloudLink.refresh();
-		this.updateReadinessSummary();
-	}
-
-	updateReadinessSummary() {
-		const driveActive = Boolean(this.cloud?.hasDriveAccess());
-		const dropboxActive = Boolean(this.cloud?.hasDropboxAccess());
-		const diskMeta = readDiskRecordingState();
-		const diskReady = Boolean(STUDIO_DISK_FEATURE_FLAG && diskMeta.enabled && diskMeta.folderName);
-		const guestBackup = this.guestBackup.getSnapshot();
-		const icecastLive = Boolean(this.icecastController?.isLive());
-		if (this.isoSummary) {
-			this.isoSummary.style.display = driveActive || dropboxActive || diskReady || icecastLive ? "" : "none";
-		}
-		this.updateDestinationLights(driveActive, dropboxActive, diskReady, diskMeta, guestBackup);
-
-		if (this.captureSummaryNode) {
-			this.captureSummaryNode.textContent = `Capture: ${this.captureMode.describeCaptureMode(this.captureMode.getMode())}`;
-		}
-		if (this.backupSummaryNode) {
-			if (!guestBackup.total) {
-				this.backupSummaryNode.textContent = "Backup: No guests connected";
-			} else if (!guestBackup.requested) {
-				this.backupSummaryNode.textContent = "Backup: None";
-			} else {
-				this.backupSummaryNode.textContent = `Backup: Guest backup ${guestBackup.confirmed}/${guestBackup.total} confirmed`;
-			}
-		}
-		if (this.saveSummaryNode) {
-			this.saveSummaryNode.textContent = `Save: ${this.describeSaveTargetSummary()}`;
-		}
-		if (this.summaryWarningNode) {
-			let warningText = "No live backup active. Host capture stays buffered until stop.";
-			let warningState = "";
-			if (!guestBackup.total) {
-				warningText = "No guests connected yet. Host capture stays buffered until stop.";
-				warningState = "pending";
-			} else if (guestBackup.confirmed === guestBackup.total && guestBackup.total > 0) {
-				warningText = "Live guest backup active for all connected guests.";
-				warningState = "ready";
-			} else if (guestBackup.requested) {
-				warningText = `Live guest backup confirmed for ${guestBackup.confirmed}/${guestBackup.total}. Unconfirmed guests are not backed up yet.`;
-			}
-			this.summaryWarningNode.textContent = warningText;
-			if (warningState) {
-				this.summaryWarningNode.dataset.state = warningState;
-			} else if (this.summaryWarningNode.dataset) {
-				delete this.summaryWarningNode.dataset.state;
-			}
-		}
-		if (this.cloudSummaryNode) {
-			const afterSessionTargets = [];
-			if (diskReady) {
-				afterSessionTargets.push(`Local folder (${diskMeta.folderName})`);
-			}
-			if (driveActive) {
-				afterSessionTargets.push("Drive");
-			}
-			if (dropboxActive) {
-				afterSessionTargets.push("Dropbox");
-			}
-			if (icecastLive) {
-				afterSessionTargets.push("Icecast live");
-			}
-			this.cloudSummaryNode.textContent = afterSessionTargets.length ? `Outputs: ${afterSessionTargets.join(" • ")}` : "After-session save: Browser buffer only";
-			this.cloudSummaryNode.dataset.state = afterSessionTargets.length ? "ready" : "pending";
-		}
-		this.guestBackup.updateControls();
-	}
-
-	updateDestinationLights(driveActive, dropboxActive, diskReady, diskMeta, guestBackup) {
-		const setLight = (key, state, statusText) => {
-			const light = this.destinationLights[key];
-			if (!light) return;
-			light.el.dataset.state = state;
-			if (light.status) light.status.textContent = statusText || "";
-		};
-
-		setLight("download", "green", "Always on");
-
-		setLight("dropbox", dropboxActive ? "green" : "gray", dropboxActive ? "After recording" : "Not connected");
-
-		// Drive = guest direct upload path
-		if (!driveActive) {
-			setLight("drive", "gray", "Not connected");
-		} else if (!guestBackup.total) {
-			setLight("drive", "yellow", "Connected — no guests");
-		} else if (!guestBackup.requested) {
-			setLight("drive", "yellow", "Connected — not enabled");
-		} else if (guestBackup.confirmed === guestBackup.total) {
-			setLight("drive", "green", `${guestBackup.confirmed}/${guestBackup.total} recording`);
-		} else {
-			setLight("drive", "yellow", `${guestBackup.confirmed}/${guestBackup.total} confirmed`);
-		}
-
-		if (STUDIO_DISK_FEATURE_FLAG) {
-			if (diskReady) {
-				setLight("disk", "green", diskMeta.folderName || "Ready");
-			} else if (diskMeta.enabled) {
-				setLight("disk", "yellow", "No folder");
-			} else {
-				setLight("disk", "gray", "Not set up");
-			}
-		}
 	}
 
 	formatFileSize(bytes) {
@@ -1895,66 +1783,6 @@ class PodcastStudioApp {
 			parts.push(`${meta.durationSeconds.toFixed(1)}s`);
 		}
 		return parts.join(" • ");
-	}
-
-	describeService(service) {
-		if (service === "drive") {
-			return "Drive";
-		}
-		if (service === "dropbox") {
-			return "Dropbox";
-		}
-		if (service === "local") {
-			return "Local disk";
-		}
-		return service || "Service";
-	}
-
-	normalizeUploadStatus(service, status) {
-		if (service === "drive" && status === "uploaded") {
-			// Legacy Drive flows finalize asynchronously after blob handoff.
-			return "queued";
-		}
-		return status || "unknown";
-	}
-
-	createServiceStatusLine(service) {
-		const line = createElement("div", "upload-status-line");
-		line.dataset.service = service;
-		const ready = service === "drive" ? this.cloud?.hasDriveAccess() : service === "dropbox" ? this.cloud?.hasDropboxAccess() : service === "local" ? this.diskRecording.isDestinationReady() : false;
-		const hint = ready ? (service === "local" ? "armed" : "ready") : service === "local" ? "not armed" : "link to upload";
-		line.textContent = `${this.describeService(service)}: ${hint}`;
-		if (service === "local") {
-			line.title = ready ? "Files will be written into the armed local folder after recording stops." : "Arm local disk recording above to write files directly into the selected folder.";
-		} else {
-			line.title = ready ? `${this.describeService(service)} is linked; uploads will start when queued.` : `Link ${this.describeService(service)} above to enable uploads.`;
-		}
-		return line;
-	}
-
-	applyUploadResult(element, result) {
-		if (!element || !result) {
-			return;
-		}
-		const service = result.service || element.dataset.service;
-		const label = this.describeService(service);
-		const normalizedStatus = this.normalizeUploadStatus(service, result.status);
-		element.dataset.status = normalizedStatus;
-		if (normalizedStatus === "queued") {
-			const sizeText = result.bytes ? ` (${this.formatFileSize(result.bytes)})` : "";
-			element.textContent = `${label}: queued${sizeText}`;
-		} else if (normalizedStatus === "uploaded") {
-			const sizeText = result.bytes ? ` (${this.formatFileSize(result.bytes)})` : "";
-			element.textContent = `${label}: uploaded${sizeText}`;
-		} else if (normalizedStatus === "skipped") {
-			element.textContent = `${label}: ${result.reason || "skipped"}`;
-		} else if (normalizedStatus === "error") {
-			const message = result.error?.message || result.error?.toString() || "failed";
-			element.textContent = `${label}: ${message}`;
-			element.dataset.status = "error";
-		} else {
-			element.textContent = `${label}: ${normalizedStatus}`;
-		}
 	}
 
 	async saveBlobToArmedDisk(blob, filename) {
@@ -2038,7 +1866,7 @@ class PodcastStudioApp {
 			}
 		}
 		if (dropboxLine) {
-			dropboxLine.textContent = `${this.describeService("dropbox")}: ${canDropbox ? "preparing upload…" : "not connected"}`;
+			dropboxLine.textContent = `${this.preflight.describeService("dropbox")}: ${canDropbox ? "preparing upload…" : "not connected"}`;
 			dropboxLine.dataset.status = canDropbox ? "pending" : "idle";
 		}
 		if (!canDropbox) return;
@@ -2051,7 +1879,7 @@ class PodcastStudioApp {
 				dropbox: true,
 				onProgress: progress => {
 					if (progress?.service === "dropbox" && dropboxLine) {
-						dropboxLine.textContent = `${this.describeService("dropbox")}: ${progress.percentage || 0}%`;
+						dropboxLine.textContent = `${this.preflight.describeService("dropbox")}: ${progress.percentage || 0}%`;
 						if (uploadKey) {
 							this.uploadProgress.updateTask("dropbox", uploadKey, {
 								uploaded: progress.uploaded,
@@ -2063,9 +1891,9 @@ class PodcastStudioApp {
 				},
 				signal: this.abortUploadsController?.signal
 			});
-			this.applyUploadResult(dropboxLine, results.dropbox);
+			this.preflight.applyUploadResult(dropboxLine, results.dropbox);
 			if (uploadKey) {
-				const status = this.normalizeUploadStatus("dropbox", results.dropbox?.status || "unknown");
+				const status = this.preflight.normalizeUploadStatus("dropbox", results.dropbox?.status || "unknown");
 				this.uploadProgress.finalizeTask("dropbox", uploadKey, status);
 			}
 		} catch (error) {
@@ -2078,7 +1906,7 @@ class PodcastStudioApp {
 				this.uploadProgress.finalizeTask("dropbox", uploadKey, "error");
 			}
 		} finally {
-			this.updateCloudFooter();
+			this.preflight.updateCloudFooter();
 		}
 	}
 
@@ -2106,6 +1934,7 @@ class PodcastStudioApp {
 		this.inviteLink?.dispose();
 		this.cloudLink?.dispose();
 		this.captureMode?.dispose();
+		this.preflight?.dispose();
 		this.stopRecordingStatusTimer();
 		if (this.diskStateListener) {
 			window.removeEventListener(PODCAST_DISK_EVENT, this.diskStateListener);
