@@ -1,12 +1,10 @@
 import { waitForLegacySession, levelBus, LEVEL_EVENT, MultiTrackRecorder, CloudUploadCoordinator, bridgeLegacyMeters } from "../core/index.js";
 import { readDiskRecordingState, verifyStoredDiskRecordingDirectory, readDiskDirectoryHandle } from "./disk-recording-store.js?v=1";
-import { readCloudLinkStatus } from "./cloud-link-store.js?v=1";
 import { readPreflightState, writePreflightState, isPreflightFresh } from "./preflight-store.js?v=1";
 import { IcecastController } from "./icecast-controller.js?v=1";
 import { ROOM_QUERY_KEYS, DIRECTOR_QUERY_KEYS, sanitizeRoomSlug, getRoomSlugFromParams, readStoredRoomState, persistStoredRoomState } from "./room-state-store.js?v=1";
 import { injectStylesheet, createElement, makeCollapsible } from "./dom-helpers.js?v=1";
 import { formatRelativeTime } from "./time-format.js?v=1";
-import { createRecordingSessionId, snapshotHighResClock } from "./recording-session-utils.js?v=1";
 import { runPreflightChecklist } from "./preflight-checklist.js?v=1";
 import { MarkerLog } from "./marker-log.js?v=1";
 import { HostMicController } from "./host-mic-controller.js?v=1";
@@ -22,11 +20,10 @@ import { CaptureModeController } from "./capture-mode-controller.js?v=1";
 import { PreflightController } from "./preflight-controller.js?v=1";
 import { TracklistController } from "./tracklist-controller.js?v=1";
 import { RecordingStatusController } from "./recording-status-controller.js?v=1";
+import { RecordingControlController } from "./recording-control-controller.js?v=1";
 
 const STUDIO_ROOT_ID = "podcast-root";
 const PODCAST_DISK_EVENT = "podcast-disk-state";
-const PODCAST_RECORD_PLAN_EVENT = "podcast-record-plan";
-const PODCAST_RECORD_STATUS_EVENT = "podcast-record-status";
 const STUDIO_DISK_FEATURE_FLAG = (() => {
 	let enabled = true;
 	if (typeof urlParams !== "undefined" && urlParams) {
@@ -41,17 +38,6 @@ const STUDIO_DISK_FEATURE_FLAG = (() => {
 })();
 
 const STUDIO_VIDEO_FEATURE_FLAG = true;
-
-function dispatchStudioEvent(name, detail = {}) {
-	if (typeof window === "undefined" || typeof window.dispatchEvent !== "function") {
-		return;
-	}
-	try {
-		window.dispatchEvent(new CustomEvent(name, { detail }));
-	} catch (error) {
-		console.warn("Unable to dispatch studio event", name, error);
-	}
-}
 
 function buildRoomGate(defaults = {}) {
 	injectStylesheet();
@@ -293,7 +279,7 @@ class PodcastStudioApp {
 			updateGuestBackupAvailability: uuid => this.guestBackup.updateActionAvailability(uuid),
 			onOpenRemoteControls: uuid => this.remoteControls.open(uuid),
 			onParticipantSeen: participant => this.tracklist.captureParticipantMetrics(participant),
-			onParticipantAdded: participant => this.tryAddParticipantToRecording(participant),
+			onParticipantAdded: participant => this.recordingControl.tryAddParticipantToRecording(participant),
 			onParticipantRemoved: uuid => this.remoteControls.closeIfActive(uuid),
 			onBeforeRefresh: () => this.updateRoomIndicator(),
 			onAfterRefresh: () => {
@@ -327,7 +313,7 @@ class PodcastStudioApp {
 		});
 		this.captureMode = new CaptureModeController({
 			onModeChange: () => {
-				this.updateRecordingButtons();
+				this.recordingControl.updateRecordingButtons();
 				this.preflight.updateReadinessSummary();
 			}
 		});
@@ -353,6 +339,50 @@ class PodcastStudioApp {
 			countTracks: () => this.countEstimatedRecordingTracks(),
 			getBackupLabel: () => this.guestBackup.getCompactLabel(),
 			formatDuration: seconds => this.formatDuration(seconds)
+		});
+		this.recordingControl = new RecordingControlController({
+			getRecording: () => this.recording,
+			setRecording: value => {
+				this.recording = value;
+			},
+			getRecordTransitioning: () => this.recordTransitioning,
+			setRecordTransitioning: value => {
+				this.recordTransitioning = value;
+			},
+			getRecordStartedAt: () => this.recordStartedAt,
+			setRecordStartedAt: value => {
+				this.recordStartedAt = value;
+			},
+			getRecordingPlan: () => this.recordingPlan,
+			setRecordingPlan: value => {
+				this.recordingPlan = value;
+			},
+			getRecordingSessionId: () => this.recordingSessionId,
+			setRecordingSessionId: value => {
+				this.recordingSessionId = value;
+			},
+			getTrackRuntimeStats: () => this.trackRuntimeStats,
+			resetAbortController: () => {
+				if (this.abortUploadsController) {
+					this.abortUploadsController.abort();
+				}
+				this.abortUploadsController = new AbortController();
+			},
+			getRecorder: () => this.recorder,
+			getTracklist: () => this.tracklist,
+			getMarkerLog: () => this.markerLog,
+			getRecordingStatus: () => this.recordingStatus,
+			getCaptureMode: () => this.captureMode,
+			updateHostMicUI: () => this.hostMicController.updateUI(),
+			setUploadPending: pending => this.uploadProgress.setPending(pending),
+			updateGuestBackupControls: () => this.guestBackup.updateControls(),
+			hasDriveAccess: () => Boolean(this.cloud?.hasDriveAccess()),
+			hasDropboxAccess: () => Boolean(this.cloud?.hasDropboxAccess()),
+			cleanupDownloadUrls: () => this.cleanupDownloadUrls(),
+			updateRecordingRuntimeMetrics: (key, indicator, detail) => this.updateRecordingRuntimeMetrics(key, indicator, detail),
+			presentRecordings: files => this.presentRecordings(files),
+			setStatusMessage: message => this.setStatusMessage(message),
+			resolveRoomName: () => this.resolveRoomName()
 		});
 		this.chatModule = null;
 		this.chatPlaceholder = null;
@@ -406,7 +436,7 @@ class PodcastStudioApp {
 		this.buildLayout();
 		this.icecastController.updateUI();
 		this.preflight.updateReadinessSummary();
-		this.updateRecordingButtons();
+		this.recordingControl.updateRecordingButtons();
 		if (STUDIO_DISK_FEATURE_FLAG) {
 			this.diskStateListener = () => {
 				this.diskRecording.updateUI();
@@ -416,7 +446,7 @@ class PodcastStudioApp {
 		}
 		this.updateRoomIndicator();
 		this.preflight.updateCloudFooter();
-		this.attachRecorderEvents();
+		this.recordingControl.attachRecorderEvents();
 		this.roster.refresh();
 		this.roster.startLoop();
 		this.levelOff = levelBus.on(LEVEL_EVENT, payload => this.updateMeterFromBus(payload));
@@ -589,7 +619,7 @@ class PodcastStudioApp {
 			isRecording: () => this.recording,
 			getElapsedSeconds: () => (this.recording ? (Date.now() - this.recordStartedAt) / 1000 : 0),
 			getSessionId: () => this.recordingSessionId || this.recordingPlan?.sessionId,
-			onEvent: (type, data) => this.logRecordingEvent(type, data)
+			onEvent: (type, data) => this.recordingControl.logRecordingEvent(type, data)
 		});
 		this.markerLog.render();
 		markersPanel.append(markerLogEl, markerActions);
@@ -628,9 +658,14 @@ class PodcastStudioApp {
 		const captureWrap = this.captureMode.buildControl();
 		transportButtons.append(captureWrap, this.recordButton);
 		transportButtons.append(this.markerButton);
+		this.recordingControl.bindNodes({
+			recordButton: this.recordButton,
+			markerButton: this.markerButton,
+			recordingSummary: this.recordingSummary
+		});
 
 		this.recordShowButton = createElement("button", "record-group-button", { type: "button", text: "🎬 Record Group", title: "Open a popup window with the combined scene for screen recording." });
-		this.recordShowButton.addEventListener("click", () => this.openRecordShowWindow());
+		this.recordShowButton.addEventListener("click", () => this.recordingControl.openRecordShowWindow());
 
 		const recordingStatusNode = createElement("div", "session-recording-status", { text: "Idle" });
 		recordingStatusNode.dataset.state = "idle";
@@ -929,155 +964,6 @@ class PodcastStudioApp {
 		return Math.max(count, this.tracklist.getIndicatorCount());
 	}
 
-	updateRecordingButtons() {
-		if (this.recordButton) {
-			this.recordButton.classList.toggle("recording", this.recording);
-			this.recordButton.disabled = this.recordTransitioning;
-			this.recordButton.textContent = this.recording ? "Stop Recording" : "Start Recording";
-			this.recordButton.title = this.recording ? "Stop the current ISO recording." : `Start ${this.captureMode.describeCaptureMode(this.captureMode.getMode())} capture.`;
-		}
-		this.captureMode.setRecording(this.recording);
-		this.guestBackup.updateControls();
-	}
-
-	attachRecorderEvents() {
-		this.recorder.addEventListener("start", event => {
-			if (this.abortUploadsController) {
-				this.abortUploadsController.abort();
-			}
-			this.abortUploadsController = new AbortController();
-			this.cleanupDownloadUrls();
-			this.trackRuntimeStats.clear();
-			this.tracklist.clearTrackLevelNodes();
-			this.tracklist.teardownSpectrograms();
-			this.tracklist.clearOutputIndicators();
-			this.recording = true;
-			this.recordTransitioning = false;
-			this.recordStartedAt = event?.detail?.startedAt || Date.now();
-			this.markerLog.reset();
-			this.markerLog.scheduleAutoSync();
-			this.updateRecordingButtons();
-			this.markerButton.disabled = false;
-			this.tracklist.showOutputsMessage("Recording… tracks will appear as media arrives.");
-			this.hostMicController.updateUI();
-			this.uploadProgress.setPending(true);
-			if (this.recordingPlan?.sync) {
-				this.recordingPlan.sync.start = {
-					wallClock: this.recordStartedAt,
-					highRes: snapshotHighResClock()
-				};
-			}
-			this.logRecordingEvent("record:start", { sessionId: this.recordingSessionId, mode: this.captureMode.getMode() });
-			this.updateRecordingPlanStatus("started", { events: this.recordingPlan?.events || [] });
-			this.recordingStatus.set(this.captureMode.getMode() === "video" ? "Recording audio + video ISOs" : "Recording audio ISOs", "active");
-			if (this.recordingSummary) this.recordingSummary.style.display = "";
-			this.recordingStatus.startTimer();
-		});
-
-		this.recorder.addEventListener("chunk", event => {
-			const { participant, trackType, channelIndex } = event.detail || {};
-			if (!participant || !trackType) {
-				return;
-			}
-			const channelKey = typeof channelIndex === "number" ? channelIndex : 0;
-			const key = this.tracklist.buildTrackKey(participant.uuid, trackType, channelKey);
-			if (!key) {
-				return;
-			}
-			const indicator = this.tracklist.ensureOutputIndicator(key, participant, trackType, channelKey);
-			if (!indicator) {
-				return;
-			}
-			indicator.badge.textContent = "Recording";
-			indicator.wrapper.dataset.state = "recording";
-			this.updateRecordingRuntimeMetrics(key, indicator, event.detail);
-			this.trackManifestChunk(event.detail);
-		});
-
-		this.recorder.addEventListener("meter-ready", event => {
-			const { participant, trackType, channelIndex, meter } = event.detail || {};
-			if (!participant?.uuid || trackType !== "audio") {
-				return;
-			}
-			const key = this.tracklist.buildTrackKey(participant.uuid, trackType, channelIndex);
-			if (!key) {
-				return;
-			}
-			const indicator = this.tracklist.getIndicator(key);
-			if (!indicator) {
-				return;
-			}
-			this.tracklist.attachSpectrogram(key, indicator, participant, trackType, channelIndex, meter);
-		});
-
-		this.recorder.addEventListener("participant-added", event => {
-			const { participant, startOffsetSeconds } = event.detail || {};
-			if (!participant) {
-				return;
-			}
-			const annotateLateJoin = (trackType, trackIndex) => {
-				const key = this.tracklist.buildTrackKey(participant.uuid, trackType, trackIndex);
-				if (key) {
-					const indicator = this.tracklist.ensureOutputIndicator(key, participant, trackType, trackIndex);
-					if (indicator?.badge) {
-						indicator.badge.textContent = "Late join";
-						indicator.badge.title = `Joined ${startOffsetSeconds?.toFixed(1) || "?"}s into recording`;
-					}
-				}
-			};
-			const audioTracks = participant.stream?.getAudioTracks?.() || [];
-			if (audioTracks.length) {
-				audioTracks.forEach((_track, index) => annotateLateJoin("audio", index));
-			}
-			const videoTracks = participant.stream?.getVideoTracks?.() || [];
-			if (videoTracks.length) {
-				videoTracks.forEach((_track, index) => annotateLateJoin("video", index));
-			}
-			if (!audioTracks.length && !videoTracks.length) {
-				annotateLateJoin("audio", 0);
-			}
-		});
-
-		this.recorder.addEventListener("error", event => {
-			console.error("Recorder error", event.detail);
-			this.setStatusMessage("Recorder error: " + (event.detail?.message || "unknown"));
-		});
-
-		this.recorder.addEventListener("stop", event => {
-			this.recording = false;
-			this.recordTransitioning = false;
-			this.recordingStatus.stopTimer();
-			this.updateRecordingButtons();
-			this.markerButton.disabled = true;
-			this.markerLog.clearAutoTimer();
-			this.tracklist.showOutputsMessage("Finalising recordings…");
-			this.tracklist.clearTrackLevelNodes();
-			this.tracklist.teardownSpectrograms();
-			this.presentRecordings(event.detail?.files);
-			this.tracklist.clearOutputIndicators();
-			this.trackRuntimeStats.clear();
-			this.hostMicController.updateUI();
-			if (this.recordingPlan?.sync) {
-				this.recordingPlan.sync.stop = {
-					wallClock: Date.now(),
-					highRes: snapshotHighResClock()
-				};
-			}
-			if (this.recordingPlan) {
-				this.recordingPlan.files = this.summariseRecordingFiles(event.detail?.files);
-				this.logRecordingEvent("record:stop", {
-					fileCount: this.recordingPlan?.files?.length || 0,
-					mode: this.captureMode.getMode()
-				});
-				this.updateRecordingPlanStatus("stopped", {
-					files: this.recordingPlan.files,
-					events: this.recordingPlan.events
-				});
-			}
-			this.recordingStatus.set("Recording idle", "idle");
-		});
-	}
-
 	setStatusMessage(message) {
 		this.tracklist.showOutputsMessage(message);
 	}
@@ -1118,147 +1004,6 @@ class PodcastStudioApp {
 		this.trackRuntimeStats.set(key, runtime);
 	}
 
-	buildRecordingPlanContext({ diskInfo } = {}) {
-		const now = Date.now();
-		const cloudSnapshot = readCloudLinkStatus();
-		const plan = {
-			sessionId: createRecordingSessionId(),
-			conductor: "studio",
-			preparedAt: now,
-			disk: {
-				enabled: Boolean(diskInfo?.ready),
-				folderName: diskInfo?.folderName || null,
-				verifiedAt: diskInfo?.verifiedAt || null
-			},
-			cloud: {
-				driveLinked: Boolean(this.cloud?.hasDriveAccess() || cloudSnapshot.drive),
-				dropboxLinked: Boolean(this.cloud?.hasDropboxAccess() || cloudSnapshot.dropbox),
-				snapshot: cloudSnapshot
-			},
-			sync: {
-				prepared: snapshotHighResClock(),
-				start: null,
-				stop: null
-			},
-			capture: {
-				mode: this.captureMode.getMode(),
-				includeVideo: this.captureMode.getMode() === "video",
-				includeScreenshares: this.captureMode.getMode() === "video"
-			},
-			participants: {},
-			files: [],
-			events: []
-		};
-		this.recordingPlan = plan;
-		this.recordingSessionId = plan.sessionId;
-		this.logRecordingEvent("record:plan", { sessionId: plan.sessionId });
-		dispatchStudioEvent(PODCAST_RECORD_PLAN_EVENT, { plan });
-		this.recordingStatus.set("Recording plan armed", "armed");
-		return plan;
-	}
-
-	updateRecordingPlanStatus(status, extra = {}) {
-		if (!this.recordingPlan) {
-			return;
-		}
-		const detail = {
-			status,
-			plan: this.recordingPlan,
-			timestamp: Date.now(),
-			...extra
-		};
-		dispatchStudioEvent(PODCAST_RECORD_STATUS_EVENT, detail);
-	}
-
-	trackManifestChunk(detail) {
-		if (!this.recordingPlan || !detail?.participant?.uuid) {
-			return;
-		}
-		const participantId = detail.participant.uuid;
-		if (!this.recordingPlan.participants[participantId]) {
-			this.recordingPlan.participants[participantId] = {
-				participantId,
-				label: detail.participant.label || participantId,
-				tracks: {}
-			};
-		}
-		const participantPlan = this.recordingPlan.participants[participantId];
-		const trackKey = `${detail.trackType || "audio"}:${typeof detail.channelIndex === "number" ? detail.channelIndex : 0}`;
-		if (!participantPlan.tracks[trackKey]) {
-			participantPlan.tracks[trackKey] = {
-				trackType: detail.trackType || "audio",
-				channelIndex: typeof detail.channelIndex === "number" ? detail.channelIndex : 0,
-				segments: [],
-				totalBytes: 0,
-				sequence: 0
-			};
-		}
-		const track = participantPlan.tracks[trackKey];
-		const bytes = detail.data?.size || 0;
-		track.sequence += 1;
-		track.totalBytes += bytes;
-		const timecodeMs = this.recordStartedAt ? Date.now() - this.recordStartedAt : 0;
-		const segment = {
-			sequence: track.sequence,
-			bytes,
-			receivedAt: Date.now(),
-			timecodeMs
-		};
-		if (track.segments.length > 48) {
-			track.segments.shift();
-		}
-		track.segments.push(segment);
-	}
-
-	summariseRecordingFiles(filesMap) {
-		if (!filesMap || typeof filesMap.forEach !== "function") {
-			return [];
-		}
-		const summaries = [];
-		filesMap.forEach(meta => {
-			if (!meta) {
-				return;
-			}
-			summaries.push({
-				participant: meta.participant?.uuid || null,
-				label: meta.participant?.label || null,
-				trackType: meta.trackType,
-				channelIndex: meta.channelIndex,
-				filename: meta.filename,
-				mimeType: meta.mimeType,
-				size: meta.size,
-				durationSeconds: meta.durationSeconds
-			});
-		});
-		return summaries;
-	}
-
-	logRecordingEvent(type, data = {}) {
-		if (!type) {
-			return;
-		}
-		if (!this.recordingPlan) {
-			this.recordingPlan = {
-				sessionId: createRecordingSessionId(),
-				events: []
-			};
-		}
-		if (!Array.isArray(this.recordingPlan.events)) {
-			this.recordingPlan.events = [];
-		}
-		const timestamp = Date.now();
-		const timecodeMs = this.recordStartedAt ? Math.max(0, timestamp - this.recordStartedAt) : 0;
-		this.recordingPlan.events.push({
-			type,
-			timestamp,
-			timecodeMs,
-			data
-		});
-		if (this.recordingPlan.events.length > 2000) {
-			this.recordingPlan.events.shift();
-		}
-	}
-
 	formatBitrate(value) {
 		if (!Number.isFinite(value) || value <= 0) {
 			return null;
@@ -1290,9 +1035,9 @@ class PodcastStudioApp {
 		}
 		if (this.recording) {
 			this.recordTransitioning = true;
-			this.updateRecordingButtons();
+			this.recordingControl.updateRecordingButtons();
 			this.tracklist.showOutputsMessage("Wrapping up recording…");
-			this.logRecordingEvent("record:stop:requested", { reason: "host-toggle" });
+			this.recordingControl.logRecordingEvent("record:stop:requested", { reason: "host-toggle" });
 			this.recordingStatus.set("Stopping recording…", "stopping");
 			if (this.markerButton) {
 				this.markerButton.disabled = true;
@@ -1305,26 +1050,26 @@ class PodcastStudioApp {
 				console.error("Failed to stop recorder cleanly", error);
 				this.setStatusMessage("Recording stop failed: " + (error?.message || "unknown error"));
 				this.recordTransitioning = false;
-				this.updateRecordingButtons();
+				this.recordingControl.updateRecordingButtons();
 			}
 			return;
 		}
 		try {
 			this.recordTransitioning = true;
-			this.updateRecordingButtons();
+			this.recordingControl.updateRecordingButtons();
 			let diskInfo = null;
 			if (STUDIO_DISK_FEATURE_FLAG && this.diskRecording.enabled) {
 				diskInfo = await this.diskRecording.ensureCaptureReadiness({ interactive: true });
 				if (diskInfo && diskInfo.error) {
 					this.setStatusMessage(diskInfo.error.message || "Disk folder not accessible.");
 					this.recordTransitioning = false;
-					this.updateRecordingButtons();
+					this.recordingControl.updateRecordingButtons();
 					return;
 				}
 			}
-			this.buildRecordingPlanContext({ diskInfo });
-			this.logRecordingEvent("record:arm", { source: "host-toggle", mode: this.captureMode.getMode() });
-			this.updateRecordingPlanStatus("armed", { events: this.recordingPlan?.events || [] });
+			this.recordingControl.buildRecordingPlanContext({ diskInfo });
+			this.recordingControl.logRecordingEvent("record:arm", { source: "host-toggle", mode: this.captureMode.getMode() });
+			this.recordingControl.updateRecordingPlanStatus("armed", { events: this.recordingPlan?.events || [] });
 			this.recordingStatus.set(this.captureMode.getMode() === "video" ? "Arming audio + video ISOs…" : "Arming audio ISOs…", "arming");
 			const recordingOptions = this.captureMode.getRecordingModeOptions(this.captureMode.getMode());
 			await this.recorder.start({
@@ -1338,74 +1083,12 @@ class PodcastStudioApp {
 			this.setStatusMessage("Unable to start recording: " + (error?.message || "unknown error"));
 			this.hostMicController.updateUI();
 			this.recordTransitioning = false;
-			this.updateRecordingButtons();
+			this.recordingControl.updateRecordingButtons();
 			this.recordingStatus.stopTimer();
-			this.logRecordingEvent("record:error", { stage: "start", message: error?.message || "unknown error" });
+			this.recordingControl.logRecordingEvent("record:error", { stage: "start", message: error?.message || "unknown error" });
 			this.recordingStatus.set("Recording idle", "error");
-			this.updateRecordingPlanStatus("error", { error: error?.message || "start failed", events: this.recordingPlan?.events || [] });
+			this.recordingControl.updateRecordingPlanStatus("error", { error: error?.message || "start failed", events: this.recordingPlan?.events || [] });
 			this.uploadProgress.setPending(false);
-		}
-	}
-
-	tryAddParticipantToRecording(participant) {
-		if (!this.recording || !this.recorder) {
-			return;
-		}
-		if (!participant?.stream) {
-			return;
-		}
-		try {
-			const result = this.recorder.addParticipant(participant);
-			if (result?.added) {
-				console.log(`Added late-joining participant to recording: ${participant.label || participant.uuid} (offset: ${result.startOffsetSeconds?.toFixed(1)}s)`);
-				this.logRecordingEvent("participant:added-mid-recording", {
-					uuid: participant.uuid,
-					label: participant.label,
-					startOffsetSeconds: result.startOffsetSeconds,
-					trackCount: result.tracks
-				});
-				// Drop a sync marker so the new track can be aligned with existing tracks
-				this.addSyncMarkerForNewTrack(participant, result.startOffsetSeconds);
-			}
-		} catch (error) {
-			console.warn("Failed to add participant to recording", error);
-		}
-	}
-
-	addSyncMarkerForNewTrack(participant, startOffsetSeconds) {
-		if (!this.recording || !this.recordStartedAt) {
-			return;
-		}
-		// Wait 1 second after track starts, then drop a sync marker
-		// This gives the track time to stabilize before the sync point
-		setTimeout(() => {
-			if (!this.recording) {
-				return;
-			}
-			const timestamp = this.recordStartedAt ? (Date.now() - this.recordStartedAt) / 1000 : startOffsetSeconds + 1;
-			const label = participant?.label || participant?.uuid || "Guest";
-			const note = {
-				time: timestamp,
-				label: `Sync: ${label} joined @ ${timestamp.toFixed(1)}s`,
-				auto: true,
-				joinSync: true
-			};
-			this.markerLog.add(note);
-		}, 1000);
-	}
-
-	openRecordShowWindow() {
-		const room = this.resolveRoomName();
-		if (!room) {
-			this.setStatusMessage("Set a room name before recording the show.");
-			return;
-		}
-		// Build URL to the main VDO.ninja with scene + recordwindow
-		const baseUrl = window.location.origin + window.location.pathname.replace(/\/podcast\/?.*/, "");
-		const url = `${baseUrl}/?scene=0&room=${encodeURIComponent(room)}&recordwindow&chroma=000&locked=1.777`;
-		const win = window.open(url, "recordShow", "toolbar=no,location=no,status=no,menubar=no,scrollbars=no,resizable=yes,width=1280,height=720");
-		if (win) {
-			win.focus();
 		}
 	}
 
@@ -1666,6 +1349,7 @@ class PodcastStudioApp {
 		this.preflight?.dispose();
 		this.tracklist?.dispose();
 		this.recordingStatus?.dispose();
+		this.recordingControl?.dispose();
 		if (this.diskStateListener) {
 			window.removeEventListener(PODCAST_DISK_EVENT, this.diskStateListener);
 			this.diskStateListener = null;
