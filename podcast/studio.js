@@ -21,6 +21,7 @@ import { CloudLinkController } from "./cloud-link-controller.js?v=1";
 import { CaptureModeController } from "./capture-mode-controller.js?v=1";
 import { PreflightController } from "./preflight-controller.js?v=1";
 import { TracklistController } from "./tracklist-controller.js?v=1";
+import { RecordingStatusController } from "./recording-status-controller.js?v=1";
 
 const STUDIO_ROOT_ID = "podcast-root";
 const PODCAST_DISK_EVENT = "podcast-disk-state";
@@ -274,7 +275,7 @@ class PodcastStudioApp {
 			getParticipants: () => this.getBackupParticipants(),
 			hasDriveAccess: () => Boolean(this.cloud?.hasDriveAccess()),
 			onReadinessChange: () => this.preflight.updateReadinessSummary(),
-			onRecordingStatusChange: () => this.refreshRecordingStatusLive()
+			onRecordingStatusChange: () => this.recordingStatus.refresh()
 		});
 		this.roster = new RosterController({
 			getSession: () => this.session,
@@ -298,7 +299,7 @@ class PodcastStudioApp {
 			onAfterRefresh: () => {
 				this.guestBackup.updateControls();
 				this.preflight.updateReadinessSummary();
-				this.refreshRecordingStatusLive();
+				this.recordingStatus.refresh();
 				this.icecastController.refreshSourcesIfLive();
 			}
 		});
@@ -346,6 +347,13 @@ class PodcastStudioApp {
 			getTrackMeter: (uuid, trackType, channelIndex) => (this.recorder && typeof this.recorder.getTrackMeter === "function" ? this.recorder.getTrackMeter(uuid, trackType, channelIndex) : null),
 			formatBitrate: kbps => this.formatBitrate(kbps)
 		});
+		this.recordingStatus = new RecordingStatusController({
+			isRecording: () => this.recording,
+			getRecordStartedAt: () => this.recordStartedAt,
+			countTracks: () => this.countEstimatedRecordingTracks(),
+			getBackupLabel: () => this.guestBackup.getCompactLabel(),
+			formatDuration: seconds => this.formatDuration(seconds)
+		});
 		this.chatModule = null;
 		this.chatPlaceholder = null;
 		this.chatPanel = null;
@@ -363,10 +371,6 @@ class PodcastStudioApp {
 		this.recordingSummary = null;
 		this.destinationLights = { download: null, drive: null, dropbox: null, disk: null };
 		this.isoSummary = null;
-		this.recordingStatusNode = null;
-		this.recordingStatusTimer = null;
-		this.recordingStatusBase = "Idle";
-		this.recordingStatusState = "idle";
 		this.recordTransitioning = false;
 		this.recordingPlan = null;
 		this.recordingSessionId = null;
@@ -628,10 +632,11 @@ class PodcastStudioApp {
 		this.recordShowButton = createElement("button", "record-group-button", { type: "button", text: "🎬 Record Group", title: "Open a popup window with the combined scene for screen recording." });
 		this.recordShowButton.addEventListener("click", () => this.openRecordShowWindow());
 
-		this.recordingStatusNode = createElement("div", "session-recording-status", { text: "Idle" });
-		this.recordingStatusNode.dataset.state = "idle";
+		const recordingStatusNode = createElement("div", "session-recording-status", { text: "Idle" });
+		recordingStatusNode.dataset.state = "idle";
 		const statusRow = createElement("div", "recording-status-row");
-		statusRow.append(this.recordingStatusNode);
+		statusRow.append(recordingStatusNode);
+		this.recordingStatus.bindNode(recordingStatusNode);
 
 		const destLightsRow = createElement("div", "destination-lights");
 		const createDestLight = (key, label) => {
@@ -924,35 +929,6 @@ class PodcastStudioApp {
 		return Math.max(count, this.tracklist.getIndicatorCount());
 	}
 
-	refreshRecordingStatusLive() {
-		if (!this.recordingStatusNode) {
-			return;
-		}
-		if (!this.recording || !this.recordStartedAt) {
-			this.recordingStatusNode.textContent = this.recordingStatusBase || "Idle";
-			this.recordingStatusNode.dataset.state = this.recordingStatusState || "idle";
-			return;
-		}
-		const elapsed = this.formatDuration(Math.max(0, (Date.now() - this.recordStartedAt) / 1000));
-		const trackCount = this.countEstimatedRecordingTracks();
-		const backupLabel = this.guestBackup.getCompactLabel();
-		this.recordingStatusNode.textContent = `${elapsed} | ${trackCount} track${trackCount === 1 ? "" : "s"} | ${backupLabel}`;
-		this.recordingStatusNode.dataset.state = "active";
-	}
-
-	startRecordingStatusTimer() {
-		this.stopRecordingStatusTimer();
-		this.refreshRecordingStatusLive();
-		this.recordingStatusTimer = setInterval(() => this.refreshRecordingStatusLive(), 1000);
-	}
-
-	stopRecordingStatusTimer() {
-		if (this.recordingStatusTimer) {
-			clearInterval(this.recordingStatusTimer);
-			this.recordingStatusTimer = null;
-		}
-	}
-
 	updateRecordingButtons() {
 		if (this.recordButton) {
 			this.recordButton.classList.toggle("recording", this.recording);
@@ -993,9 +969,9 @@ class PodcastStudioApp {
 			}
 			this.logRecordingEvent("record:start", { sessionId: this.recordingSessionId, mode: this.captureMode.getMode() });
 			this.updateRecordingPlanStatus("started", { events: this.recordingPlan?.events || [] });
-			this.setRecordingStatus(this.captureMode.getMode() === "video" ? "Recording audio + video ISOs" : "Recording audio ISOs", "active");
+			this.recordingStatus.set(this.captureMode.getMode() === "video" ? "Recording audio + video ISOs" : "Recording audio ISOs", "active");
 			if (this.recordingSummary) this.recordingSummary.style.display = "";
-			this.startRecordingStatusTimer();
+			this.recordingStatus.startTimer();
 		});
 
 		this.recorder.addEventListener("chunk", event => {
@@ -1070,7 +1046,7 @@ class PodcastStudioApp {
 		this.recorder.addEventListener("stop", event => {
 			this.recording = false;
 			this.recordTransitioning = false;
-			this.stopRecordingStatusTimer();
+			this.recordingStatus.stopTimer();
 			this.updateRecordingButtons();
 			this.markerButton.disabled = true;
 			this.markerLog.clearAutoTimer();
@@ -1098,7 +1074,7 @@ class PodcastStudioApp {
 					events: this.recordingPlan.events
 				});
 			}
-			this.setRecordingStatus("Recording idle", "idle");
+			this.recordingStatus.set("Recording idle", "idle");
 		});
 	}
 
@@ -1177,7 +1153,7 @@ class PodcastStudioApp {
 		this.recordingSessionId = plan.sessionId;
 		this.logRecordingEvent("record:plan", { sessionId: plan.sessionId });
 		dispatchStudioEvent(PODCAST_RECORD_PLAN_EVENT, { plan });
-		this.setRecordingStatus("Recording plan armed", "armed");
+		this.recordingStatus.set("Recording plan armed", "armed");
 		return plan;
 	}
 
@@ -1283,20 +1259,6 @@ class PodcastStudioApp {
 		}
 	}
 
-	setRecordingStatus(text, state = "idle") {
-		if (!this.recordingStatusNode) {
-			return;
-		}
-		this.recordingStatusBase = text;
-		this.recordingStatusState = state;
-		if (state === "active") {
-			this.refreshRecordingStatusLive();
-			return;
-		}
-		this.recordingStatusNode.textContent = text;
-		this.recordingStatusNode.dataset.state = state;
-	}
-
 	formatBitrate(value) {
 		if (!Number.isFinite(value) || value <= 0) {
 			return null;
@@ -1331,7 +1293,7 @@ class PodcastStudioApp {
 			this.updateRecordingButtons();
 			this.tracklist.showOutputsMessage("Wrapping up recording…");
 			this.logRecordingEvent("record:stop:requested", { reason: "host-toggle" });
-			this.setRecordingStatus("Stopping recording…", "stopping");
+			this.recordingStatus.set("Stopping recording…", "stopping");
 			if (this.markerButton) {
 				this.markerButton.disabled = true;
 			}
@@ -1363,7 +1325,7 @@ class PodcastStudioApp {
 			this.buildRecordingPlanContext({ diskInfo });
 			this.logRecordingEvent("record:arm", { source: "host-toggle", mode: this.captureMode.getMode() });
 			this.updateRecordingPlanStatus("armed", { events: this.recordingPlan?.events || [] });
-			this.setRecordingStatus(this.captureMode.getMode() === "video" ? "Arming audio + video ISOs…" : "Arming audio ISOs…", "arming");
+			this.recordingStatus.set(this.captureMode.getMode() === "video" ? "Arming audio + video ISOs…" : "Arming audio ISOs…", "arming");
 			const recordingOptions = this.captureMode.getRecordingModeOptions(this.captureMode.getMode());
 			await this.recorder.start({
 				includeVideo: recordingOptions.includeVideo,
@@ -1377,9 +1339,9 @@ class PodcastStudioApp {
 			this.hostMicController.updateUI();
 			this.recordTransitioning = false;
 			this.updateRecordingButtons();
-			this.stopRecordingStatusTimer();
+			this.recordingStatus.stopTimer();
 			this.logRecordingEvent("record:error", { stage: "start", message: error?.message || "unknown error" });
-			this.setRecordingStatus("Recording idle", "error");
+			this.recordingStatus.set("Recording idle", "error");
 			this.updateRecordingPlanStatus("error", { error: error?.message || "start failed", events: this.recordingPlan?.events || [] });
 			this.uploadProgress.setPending(false);
 		}
@@ -1703,7 +1665,7 @@ class PodcastStudioApp {
 		this.captureMode?.dispose();
 		this.preflight?.dispose();
 		this.tracklist?.dispose();
-		this.stopRecordingStatusTimer();
+		this.recordingStatus?.dispose();
 		if (this.diskStateListener) {
 			window.removeEventListener(PODCAST_DISK_EVENT, this.diskStateListener);
 			this.diskStateListener = null;
