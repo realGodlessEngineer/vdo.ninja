@@ -8241,7 +8241,16 @@ async function main() {
 	}, 50);
 
 	if (session.effect == "3" || session.effect == "4" || session.effect == "5" || session.effect == "16") {
-		attemptSegmentationEffectModelLoad();
+		var canUseLongpipe =
+			typeof longpipeHandlesEffect === "function" &&
+			typeof loadLongpipe === "function" &&
+			longpipeHandlesEffect(session.effect);
+
+		if (canUseLongpipe) {
+			loadLongpipe();
+		} else {
+			attemptSegmentationEffectModelLoad();
+		}
 	} else if (session.effect == "6") {
 		loadTensorflowJS();
 	} else if (session.effect == "9") {

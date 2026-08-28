@@ -12722,6 +12722,39 @@ function applyEffects(track) {
 	// video only please. do not touch audio.  Run update Render Outpipe () instead of this directly.
 	log("applyEffects()");
 
+	function getSafeEffectsCanvasTrack() {
+		try {
+			session.canvasCtx.filter = "none";
+			session.canvasCtx.globalCompositeOperation = "copy";
+			session.canvasCtx.fillStyle = "black";
+			session.canvasCtx.fillRect(0, 0, session.canvas.width, session.canvas.height);
+			session.canvasCtx.globalCompositeOperation = "source-over";
+		} catch (e0) {
+			errorlog(e0);
+		}
+		try {
+			var canvasTracks = session.canvas.captureStream().getVideoTracks();
+			if (canvasTracks && canvasTracks[0]) {
+				return canvasTracks[0];
+			}
+		} catch (e) {
+			errorlog(e);
+		}
+		try {
+			var mutedClone = track.clone();
+			mutedClone.enabled = false;
+			return mutedClone;
+		} catch (e2) {
+			errorlog(e2);
+		}
+		try {
+			track.enabled = false;
+		} catch (e3) {
+			errorlog(e3);
+		}
+		return track;
+	}
+
 	if (session.effect == "0" || !session.effect) {
 		// auto align face
 		return track;
@@ -12780,7 +12813,65 @@ function applyEffects(track) {
 		session.canvas.height = 2 * parseInt(session.canvasSource.height / 2);
 		session.canvas.width = 2 * parseInt(session.canvasSource.width / 2);
 
-		TFLiteWorker();
+		if (longpipeHandlesEffect(session.effect)) {
+			if (EffectsPipeline) {
+				if (session.longpipe && session.longpipeSourceTrackId === track.id) {
+					if (session.longpipe.readyForPublish) {
+						try {
+							var backgroundUpdate = session.longpipe.setBackground(effectToLongpipeBg());
+							if (backgroundUpdate && backgroundUpdate.catch) {
+								backgroundUpdate.catch(errorlog);
+							}
+						} catch (e) {
+							errorlog(e);
+						}
+						try {
+							var longpipeTracks = session.longpipe.stream.getVideoTracks();
+							if (longpipeTracks && longpipeTracks[0]) {
+								return longpipeTracks[0];
+							}
+						} catch (e2) {
+							errorlog(e2);
+						}
+					}
+					return getSafeEffectsCanvasTrack();
+				}
+				if (session.longpipe) { destroyLongpipePipeline(); }
+				try {
+					session.longpipe = new EffectsPipeline(session.canvasSource.srcObject, getLongpipeOptions());
+					session.longpipeSourceTrackId = track.id;
+					session.longpipe.readyForPublish = false;
+				} catch (e) {
+					disableLongpipe(e, false);
+					TFLiteWorker();
+					return getSafeEffectsCanvasTrack();
+				}
+
+				var pendingLongpipe = session.longpipe;
+				session.longpipe.ready.then(function () {
+					if (session.longpipe === pendingLongpipe) {
+						pendingLongpipe.readyForPublish = true;
+						updateRenderOutpipe();
+					}
+				}).catch(function (e) {
+					disableLongpipe(e);
+				});
+
+				return getSafeEffectsCanvasTrack();
+			}
+			// loadLongpipe() is still in-flight; it will call updateRenderOutpipe() when ready
+			try {
+				var longpipeLoad = loadLongpipe();
+				if (longpipeLoad && longpipeLoad.catch) {
+					longpipeLoad.catch(errorlog);
+				}
+			} catch (e) {
+				errorlog(e);
+			}
+			return getSafeEffectsCanvasTrack();
+		} else {
+			TFLiteWorker();
+		}
 	} else if (session.effect == "6") {
 		setupCanvas();
 		session.canvasSource.srcObject.addTrack(track);
@@ -57385,6 +57476,10 @@ async function effectsDynamicallyUpdate(event, ele) {
 	getById("selectEffectAmount").style.display = "none";
 	getById("selectEffectAmount3").style.display = "none";
 
+	if (session.longpipe && !isLongpipeBackedEffect(session.effect)) {
+		destroyLongpipePipeline();
+	}
+
 	if (session.effect === "1") {
 		updateRenderOutpipe();
 		return;
@@ -57464,11 +57559,18 @@ async function effectsDynamicallyUpdate(event, ele) {
 		updateRenderOutpipe();
 		return;
 	} else if (session.effect === "3" || session.effect === "4" || session.effect === "16") {
-		if (!["3", "4", "5", "16"].includes(lastEffectValue)) {
-			attemptSegmentationEffectModelLoad();
-			if (!(session.tfliteModule && session.tfliteModule.looping)) {
+		if (needsSegmentationRebuild(lastEffectValue, session.effect)) {
+			if (session.longpipe && !longpipeHandlesEffect(session.effect)) {
+				destroyLongpipePipeline();
+			}
+			longpipeHandlesEffect(session.effect) ? loadLongpipe() : attemptSegmentationEffectModelLoad();
+			if (!longpipeEnabled() && !(session.tfliteModule && session.tfliteModule.looping)) {
+				updateRenderOutpipe();
+			} else {
 				updateRenderOutpipe();
 			}
+		} else if (longpipeHandlesEffect(session.effect) && session.longpipe) {
+			session.longpipe.setBackground(effectToLongpipeBg());
 		}
 		if (session.effect === "3" && session.effectValue_default == false) {
 			getById("selectEffectAmount").style.display = "block";
@@ -57485,11 +57587,18 @@ async function effectsDynamicallyUpdate(event, ele) {
 			getById("selectEffectAmountInput3").value = session.effectValue;
 		}
 	} else if (session.effect === "5") {
-		if (!["3", "4", "5", "16"].includes(lastEffectValue)) {
-			attemptSegmentationEffectModelLoad();
-			if (!(session.tfliteModule && session.tfliteModule.looping)) {
+		if (needsSegmentationRebuild(lastEffectValue, session.effect)) {
+			if (session.longpipe && !longpipeHandlesEffect(session.effect)) {
+				destroyLongpipePipeline();
+			}
+			longpipeHandlesEffect(session.effect) ? loadLongpipe() : attemptSegmentationEffectModelLoad();
+			if (!longpipeEnabled() && !(session.tfliteModule && session.tfliteModule.looping)) {
+				updateRenderOutpipe();
+			} else {
 				updateRenderOutpipe();
 			}
+		} else if (longpipeHandlesEffect(session.effect) && session.longpipe) {
+			session.longpipe.setBackground(effectToLongpipeBg());
 		}
 		loadContentEffectsImages();
 	} else if ((session.effect === "14" || session.effect === "15") && session.effectValue_default == false) {
@@ -57897,6 +58006,251 @@ function loadTensorflowJS() {
 	document.head.appendChild(script);
 }
 
+var USE_LONGPIPE = true;
+var LONGPIPE_MODULE_URL = "./thirdparty/longpipe/longpipe.mjs";
+var LONGPIPE_WEIGHTS_BASE_URL = "./thirdparty/longpipe/models/v/0.0.4/";
+var LONGPIPE_PRESETS = {
+	xs: { model: "xs", dtype: "f16", resolution: { w: 384, h: 216 }, skipFrames: 2 },
+	small: { model: "small", dtype: "f16", resolution: { w: 384, h: 216 }, skipFrames: 1 },
+	medium: { model: "medium", dtype: "f16", resolution: { w: 512, h: 288 }, skipFrames: 1 },
+	large: { model: "large", dtype: "f32", resolution: { w: 640, h: 360 }, skipFrames: 0 },
+	xl: { model: "xl", dtype: "f32", resolution: { w: 1280, h: 720 }, skipFrames: 0 }
+};
+var LONGPIPE_PRESET_ALIASES = {
+	fast: "xs",
+	balanced: "medium",
+	quality: "xl"
+};
+var EffectsPipeline = null;
+var loadLongpipePromise = null;
+var longpipeRuntimeDisabled = false;
+
+function getLongpipeUrlParam(names) {
+	try {
+		if (typeof urlParams === "undefined" || !urlParams) return false;
+		for (var i = 0; i < names.length; i++) {
+			if (urlParams.has(names[i])) {
+				return (urlParams.get(names[i]) || "").toLowerCase();
+			}
+		}
+	} catch (e) {}
+	return false;
+}
+
+function hasLongpipeUrlParam(names) {
+	try {
+		if (typeof urlParams === "undefined" || !urlParams) return false;
+		for (var i = 0; i < names.length; i++) {
+			if (urlParams.has(names[i])) return true;
+		}
+	} catch (e) {}
+	return false;
+}
+
+function cloneLongpipePreset(preset) {
+	return {
+		model: preset.model,
+		dtype: preset.dtype,
+		resolution: { w: preset.resolution.w, h: preset.resolution.h },
+		skipFrames: preset.skipFrames
+	};
+}
+
+function getLongpipeCaptureQualityTier() {
+	try {
+		var quality = false;
+		if (session.quality !== false && typeof session.quality !== "undefined") {
+			quality = session.quality;
+		} else if (session.roomid && session.quality_room !== false && typeof session.quality_room !== "undefined") {
+			quality = session.quality_room;
+		} else if (session.quality_wb !== false && typeof session.quality_wb !== "undefined") {
+			quality = session.quality_wb;
+		}
+		quality = parseInt(quality);
+		return isNaN(quality) ? 1 : quality;
+	} catch (e) {
+		return 1;
+	}
+}
+
+function getLongpipePerformanceTier() {
+	try {
+		if (typeof session.quality_wb === "number") return session.quality_wb;
+		return judgePerformance();
+	} catch (e) {
+		return 1;
+	}
+}
+
+function hasLongpipeHighEndGpu() {
+	try {
+		if (typeof gpgpuSupport !== "string") return false;
+		var gpu = gpgpuSupport.toLowerCase();
+		return gpu.indexOf("nvidia") >= 0 ||
+			gpu.indexOf("geforce") >= 0 ||
+			gpu.indexOf("rtx") >= 0 ||
+			gpu.indexOf("gtx") >= 0 ||
+			gpu.indexOf("quadro") >= 0 ||
+			gpu.indexOf("radeon") >= 0 ||
+			gpu.indexOf("amd") >= 0 ||
+			gpu.indexOf("intel(r) arc") >= 0 ||
+			gpu.indexOf("apple") >= 0;
+	} catch (e) {
+		return false;
+	}
+}
+
+function getLongpipePresetName() {
+	if (hasLongpipeUrlParam(["longpipeauto", "lpauto"])) return "auto";
+	var requested = getLongpipeUrlParam(["longpipepreset", "lppreset", "lpmodel"]);
+	if (requested) {
+		if (requested === "auto") return "auto";
+		if (requested in LONGPIPE_PRESET_ALIASES) requested = LONGPIPE_PRESET_ALIASES[requested];
+		if (requested in LONGPIPE_PRESETS) return requested;
+		warnlog("Ignoring unknown segmentation preset: " + requested);
+	}
+
+	var captureTier = getLongpipeCaptureQualityTier();
+	var performanceTier = getLongpipePerformanceTier();
+	var highEndGpu = hasLongpipeHighEndGpu();
+
+	if (captureTier >= 2) return highEndGpu && !session.mobile ? "small" : "xs";
+	if (session.mobile) return performanceTier <= 0 && captureTier <= 0 ? "medium" : "small";
+	if (performanceTier >= 2) return "small";
+	if (highEndGpu) {
+		if (captureTier < 0) return "large";
+		return "medium";
+	}
+	return "medium";
+}
+
+function getLongpipePreset() {
+	var presetName = getLongpipePresetName();
+	if (presetName === "auto") return "auto";
+	return cloneLongpipePreset(LONGPIPE_PRESETS[presetName] || LONGPIPE_PRESETS.medium);
+}
+
+function shouldUseLongpipeAdaptive(preset) {
+	if (hasLongpipeUrlParam(["nolongpipeadaptive", "nolpadaptive"])) return false;
+	return preset === "auto" && hasLongpipeUrlParam(["longpipeadaptive", "lpadaptive"]);
+}
+
+function longpipeEnabled() {
+	return USE_LONGPIPE && !longpipeRuntimeDisabled;
+}
+
+function disableLongpipe(reason, rerender) {
+	if (longpipeRuntimeDisabled) return;
+	if (typeof rerender === "undefined") rerender = true;
+	longpipeRuntimeDisabled = true;
+	EffectsPipeline = null;
+	loadLongpipePromise = null;
+	try {
+		if (session.longpipe) {
+			destroyLongpipePipeline();
+		}
+	} catch (e) {}
+	errorlog("Segmentation engine failed; falling back to TFLite: " + reason);
+	if (rerender && (session.effect == "3" || session.effect == "4" || session.effect == "5")) {
+		try {
+			attemptSegmentationEffectModelLoad();
+		} catch (e) {
+			errorlog(e);
+		}
+		try {
+			updateRenderOutpipe();
+		} catch (e) {
+			errorlog(e);
+		}
+	}
+}
+
+function getLongpipeOptions() {
+	var preset = getLongpipePreset();
+	return {
+		background: effectToLongpipeBg(),
+		weightsBaseUrl: LONGPIPE_WEIGHTS_BASE_URL,
+		preset: preset,
+		adaptive: shouldUseLongpipeAdaptive(preset),
+		audio: "passthrough",
+		debug: hasLongpipeUrlParam(["longpipedebug", "lpdebug"]),
+		onError: function (event) {
+			var message = event && event.message ? event.message : event;
+			errorlog("Segmentation engine error: " + message);
+		}
+	};
+}
+
+async function loadLongpipe() {
+	if (!longpipeEnabled()) return;
+	if (EffectsPipeline) return EffectsPipeline;
+	if (loadLongpipePromise) return loadLongpipePromise;
+	loadLongpipePromise = import(LONGPIPE_MODULE_URL).then(function (module) {
+		var ImportedEffectsPipeline = module && module.EffectsPipeline;
+		loadLongpipePromise = null;
+		if (!longpipeEnabled()) {
+			return;
+		}
+		EffectsPipeline = ImportedEffectsPipeline;
+		if (typeof EffectsPipeline !== "function") {
+			disableLongpipe("EffectsPipeline export missing");
+			return;
+		}
+		if (session.effect == "3" || session.effect == "4" || session.effect == "5" || session.effect == "16") {
+			updateRenderOutpipe();
+		}
+		return EffectsPipeline;
+	}).catch(function (e) {
+		loadLongpipePromise = null;
+		disableLongpipe(e);
+	});
+	return loadLongpipePromise;
+}
+
+function isLongpipeBackedEffect(effect) {
+	return effect === "3" || effect === "3a" || effect === "4" || effect === "5";
+}
+
+function longpipeHandlesEffect(effect) {
+	return longpipeEnabled() && isLongpipeBackedEffect(effect);
+}
+
+function destroyLongpipePipeline() {
+	try {
+		if (session.longpipe) {
+			session.longpipe.destroy();
+			session.longpipe = null;
+		}
+		session.longpipeSourceTrackId = false;
+	} catch (e) {
+		errorlog(e);
+	}
+}
+
+function needsSegmentationRebuild(from, to) {
+	if (!["3", "4", "5", "16"].includes(from)) return true;
+	if (!longpipeEnabled()) return false;
+	return longpipeHandlesEffect(from) !== longpipeHandlesEffect(to);
+}
+
+function effectToLongpipeBg() {
+	if (session.effect == "3") {
+		var effectValue = parseFloat(session.effectValue);
+		if (isNaN(effectValue)) {
+			effectValue = 2;
+		}
+		return { blur: { strength: effectValue / 20 } };
+	}
+	if (session.effect == "4") return { color: "#00ff00" };
+	if (session.effect == "5") {
+		if (session.effectsImage && session.effectsImage.complete && session.effectsImage.naturalWidth) {
+			return session.effectsImage;
+		}
+		return session.effectsImage && session.effectsImage.src ? session.effectsImage.src : "blur";
+	}
+	return "blur";
+}
+
 var MEDIAPIPE_SELFIE_SEGMENTER = {
 	moduleUrl: "./thirdparty/mediapipe/tasks-vision/vision_bundle.mjs",
 	wasmRoot: "./thirdparty/mediapipe/tasks-vision/wasm",
@@ -58055,6 +58409,12 @@ async function changeEffectsImage(ev, ele) {
 		};
 		ele.parentNode.parentNode.insertBefore(session.effectsImage, ele.parentNode);
 		session.effectsImage.onload = () => {
+			if (longpipeHandlesEffect(session.effect) && session.longpipe && session.effect == "5") {
+				var backgroundUpdate = session.longpipe.setBackground(effectToLongpipeBg());
+				if (backgroundUpdate && backgroundUpdate.catch) {
+					backgroundUpdate.catch(errorlog);
+				}
+			}
 			URL.revokeObjectURL(session.effectsImage.src); // no longer needed, free memory
 		};
 		session.effectsImage.src = URL.createObjectURL(ele.files[0]); // set src to blob url
@@ -58065,6 +58425,12 @@ async function changeEffectsImage(ev, ele) {
 		}
 		session.effectsImage = ele;
 		session.effectsImage.classList.add("selectedContentEffectsImage");
+	}
+	if (longpipeHandlesEffect(session.effect) && session.longpipe && session.effect == "5" && session.effectsImage.complete && session.effectsImage.naturalWidth) {
+		var backgroundUpdate = session.longpipe.setBackground(effectToLongpipeBg());
+		if (backgroundUpdate && backgroundUpdate.catch) {
+			backgroundUpdate.catch(errorlog);
+		}
 	}
 }
 
@@ -58140,6 +58506,9 @@ async function changeEffectAmount(ev, ele) {
 	}
 	log("session.effectValue: " + session.effectValue);
 	saveEffectValue(session.effect, ele.value);
+	if (longpipeHandlesEffect(session.effect) && session.longpipe && session.effect == "3") {
+		session.longpipe.setBackground({ blur: { strength: parseFloat(ele.value) / 20 } });
+	}
 }
 async function loadTFLiteModel() {
 	try {

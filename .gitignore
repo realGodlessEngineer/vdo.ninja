@@ -13,3 +13,7 @@ CLAUDE.md
 cf/
 wrangler.toml
 docs.md
+
+# Longpipe / MediaPipe segmentation assets (vendored on Coolify persistent volume, installed once)
+thirdparty/longpipe/
+thirdparty/mediapipe/

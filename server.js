@@ -19,6 +19,7 @@ const fs = require("fs");
 const crypto = require("crypto");
 const express = require("express");
 const compression = require("compression");
+const { spawn } = require("child_process");
 
 const ROOT = __dirname; // the VDO.Ninja files live at the repo root
 
@@ -114,7 +115,15 @@ const config = {
 	// both Maps share one value so they stay consistent with each other. See
 	// parsedRateLimitMaxIps above for why zero/negative is rejected rather than
 	// just falling through the usual `|| 50000`.
-	rateLimitMaxIps: parsedRateLimitMaxIps > 0 ? parsedRateLimitMaxIps : 50000
+	rateLimitMaxIps: parsedRateLimitMaxIps > 0 ? parsedRateLimitMaxIps : 50000,
+	// Opt-in (Coolify / self-host): when true, the server kicks off
+	// scripts/install-longpipe-assets.mjs at boot to provision the ~139 MiB of
+	// Longpipe/MediaPipe segmentation weights onto their persistent volumes (see
+	// that script's header). It is idempotent and stamped, so it does real work
+	// only on the first deploy or after the pinned version is bumped; off by
+	// default so a plain static-client forker never unexpectedly downloads the
+	// model set.
+	installSegmentationAssets: process.env.INSTALL_LONGPIPE_ASSETS === "true"
 };
 
 try {
@@ -1175,6 +1184,22 @@ if (require.main === module) {
 	const server = app.listen(config.port, config.host, () => {
 		console.log(`VDO.Ninja client serving on http://${config.host === "0.0.0.0" ? "localhost" : config.host}:${config.port}`);
 	});
+
+	// Optional segmentation-asset provisioning (see config.installSegmentationAssets
+	// above). Fire-and-forget so a first-deploy download of the ~139 MiB model set
+	// never delays listen or fails the platform health check: the server is already
+	// up and the background-effect engine degrades to MediaPipe->TFLite until the
+	// assets land. stdio is inherited so the installer's progress shows in the
+	// deploy logs; unref() keeps this child from holding the process open at
+	// shutdown. Non-fatal by construction -- a failed install just logs, and the
+	// server keeps serving.
+	if (config.installSegmentationAssets) {
+		const installer = path.join(ROOT, "scripts", "install-longpipe-assets.mjs");
+		console.log("INSTALL_LONGPIPE_ASSETS=true — provisioning segmentation assets in the background.");
+		const child = spawn(process.execPath, [installer], { stdio: "inherit" });
+		child.on("error", err => console.error(`Could not start the segmentation-asset installer: ${err.message}`));
+		child.unref();
+	}
 
 	// Without this, a bind failure (port already in use, or insufficient
 	// privileges to bind a low port) surfaces as an unhandled "error" event --
