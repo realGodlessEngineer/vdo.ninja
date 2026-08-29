@@ -4233,6 +4233,13 @@ async function main() {
 		session.viewDirectorOnly = true;
 	}
 
+	if (urlParams.has("showmode")) {
+		// Dormant scaffolding for the show-mode redesign (call-in-show director console).
+		// No behavior is attached yet; this flag only marks the director into the new
+		// layout path once Phase 2 lands. See SHOWMODE_REDESIGN_TASKS.md.
+		session.showmode = true;
+	}
+
 	if (session.view !== false) {
 		session.view_set = session.view.split(",");
 	}
