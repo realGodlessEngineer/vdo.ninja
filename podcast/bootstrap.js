@@ -8,5 +8,5 @@ if (studioMode) {
 }
 
 if (showMode) {
-	import("../core/showmode/index.js?v=1");
+	import("../core/showmode/index.js?v=2");
 }

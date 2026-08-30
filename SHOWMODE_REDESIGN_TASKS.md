@@ -188,16 +188,52 @@ disables the legacy in-`#guestFeeds` drag-reorder / slot-lock ordering while
 
 ## Phase 3 — Director console: promote/demote interactions
 
-- [ ] Wire lane transitions to `changeGroup()` (`lib.js:56741`) + add/remove from
-      the program scene.
-- [ ] Controls: "Take → On Air", "↑ On Deck", "Hang up" (buttons first;
-      drag-between-lanes as a stretch).
-- [ ] On Deck **pre-flight checks**: mic level, camera live, "sees program feed only".
-- [ ] Green Room detail: #position badges, hold timers, connection-quality bars,
-      cam-off state — all from live stats.
+Shipped in the same `core/showmode/console.js` module — still no legacy edits. Each
+guest box gets a lane-action bar that **drives the existing legacy controls**
+rather than re-implementing them; the module cache-bust bumped to `?v=2`
+(`podcast/bootstrap.js` → `index.js?v=2`; `index.js` → `console.js?v=2`).
+
+- [x] Wire lane transitions to `changeGroup()` (`lib.js:56741`) + add/remove from
+      the program scene. **→ `setGroupExclusive(uuid, group)` sets the caller's lane
+      group exclusively (add target, drop the other two) by driving `changeGroup`
+      with an explicit `state` — a detached `<button>` carries the
+      `dataset.{group,UUID,sid}` it reads, so it is a *set*, not a toggle.
+      `toggleProgramScene(box, on)` adds/removes the guest from program scene `0`
+      via the legacy `directEnable()` toggle, gated on the button's `.value` so it
+      is idempotent. On Air adds to scene; On Deck / Green remove.**
+- [x] Controls: "Take → On Air", "↑ On Deck", "Hang up" (buttons first;
+      drag-between-lanes as a stretch). **→ Four buttons per guest box:
+      **Take On Air** / **Hold On Deck** / **To Green Room** / **Hang Up**. The
+      current lane's button is highlighted (active) and the bar is non-destructive
+      (appended as the box's last child; the box's own controls are untouched).
+      Controls attach **only to caller boxes** — never the director, co-directors
+      (`session.directorList`), or screenshare tiles, which are anchored On Air.
+      **Hang Up clicks the box's own hangup button**, so the native
+      confirm-with-block dialog runs (no silent disconnect). *Drag-between-lanes
+      remains a deferred stretch.***
+- [x] On Deck **pre-flight checks**: mic level, camera live. **→ On a box in the On
+      Deck lane the bar shows mic + camera indicators that light green when live
+      (`micLive`: the guest's `voiceMeter` is present and reporting a numeric
+      level; `camLive`: the box has a playing `<video>` with real frame data).**
+      *The "sees program feed only" check is deferred — it needs the caller's
+      remote view state, which the director side does not currently mirror.*
+- [x] Green Room detail: #position badges, hold timers, connection-quality bars,
+      cam-off state — all from live stats. **→ A Green-Room box shows a `#N` queue
+      position (its order within the lane) and a `m:ss` hold timer (time since the
+      console first saw the guest). Connection quality is the Phase 2 corner dot
+      (good/warn/bad from the 0–5 signal meter). *A dedicated cam-off badge is
+      deferred; the On Deck `camLive` indicator already surfaces camera state at
+      the point it matters most — the pre-flight before going live.***
+- [ ] Live browser validation: with `&showmode`, promoting/demoting a caller
+      actually re-groups them (and updates what they see) and the program-scene
+      toggle tracks. **→ USER-OWNED: needs a live director + caller browser
+      session; the group→view effect is the Phase 0 open item and can only be
+      confirmed live.**
 
 **Acceptance:** the director runs the whole show from the console — moving a caller
-between lanes actually re-groups them and updates what they see.
+between lanes actually re-groups them and updates what they see. **→ Code MET
+(interactions wired to `changeGroup` + `directEnable` + the native hangup);
+the live group→view confirmation is the one remaining user-owned item.**
 
 ## Phase 4 — Caller-facing source control (the new capability)
 
