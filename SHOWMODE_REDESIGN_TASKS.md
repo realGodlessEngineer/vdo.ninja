@@ -237,19 +237,53 @@ the live group→view confirmation is the one remaining user-owned item.**
 
 ## Phase 4 — Caller-facing source control (the new capability)
 
-Shape depends on the Phase 0 verdict:
+Phase 0 verdict was **GREEN**, so the native path is what shipped. Per the user's
+decision (open decision #3), Phase 4 shipped as the **console source bar** shape:
+a native designation UI that drives the *existing, proven* screenshare `:s`
+machinery rather than new WebRTC renegotiation, paired with the Phase-1
+`&callerview` routing param. Built entirely in `core/showmode/console.js`
+(module cache-bust bumped to `?v=3`); no legacy edits.
 
-- [ ] **If the `:s` publish path is reachable outside `webrtc.js`:** native director
-      "caller-facing source" selector (Camera / Screen / Media) that publishes the
-      chosen device as the second stream and auto-routes callers to it via `showonly`.
-      This is the source bar in the mockup.
-- [ ] **If it crosses into `webrtc.js`:** ship the documented two-publisher recipe
-      (clean cam + composite as separate pushes) plus a `&callercam=<id>` param that
-      auto-applies the caller routing, and record the native selector as blocked on
-      engine access.
+- [x] **Native "Caller-Facing Source" bar** at the top of the `&showmode` console
+      (above the lanes). Two states — **None** / **Screen / Composite** — rendered
+      as a segmented toggle that reflects the live second-stream state
+      (`session.screenShareState`) and drives `toggleScreenShare()`
+      (`lib.js:35329`) idempotently (only toggles when the desired state differs,
+      so repeated clicks are safe). Publishing the composite as the director's
+      screenshare rides `createSecondStream()` → `createSecondStream2(UUID)`
+      end-to-end in `lib.js` — no `webrtc.js` access, exactly as the Phase 0 spike
+      predicted.
+- [x] **Live sid readout + one-click caller invite.** When a source is publishing,
+      the bar shows the live caller-facing stream ID (`session.streamID + ":s"`) and
+      enables a **Copy caller invite link** button. The link is the director UI's
+      own guest link (`#director_block_1` `dataset.raw`, `main.js:28475` — already
+      carries room / password / token / wss params) with `&callerview=<sid>`
+      appended; it falls back to a bare `?room=<roomid>` link if the director link
+      block is absent. Clipboard write uses `navigator.clipboard` with a
+      `textarea`/`execCommand` fallback for insecure contexts. This closes the loop:
+      the director designates the source in the UI, and the generated link
+      auto-routes callers to it via the Phase-1 `&callerview` allowlist.
+- [x] i18n: `showmode-source-title` / `-none` / `-screen` / `-copy` / `-copied` /
+      `-hint` / `-hint-live` added to `translations/default.json` + `en.json`
+      (`miscellaneous`); CI fills other locales. `node --check` clean on the module;
+      `ci-validateTranslations.js` + `ci-checkTranslationKeys.js` pass (0 new
+      missing keys).
+- [ ] Live browser validation: with `&showmode`, the source bar publishes the
+      composite as the `:s` second stream, the sid + copy link appear, and a caller
+      opening the generated link sees only that source and hears the hosts.
+      **→ USER-OWNED: needs a live director + caller browser session.**
 
-**Acceptance:** the director designates the composite device shown to callers —
-from the UI if feasible, otherwise via a first-class param + recipe.
+**Deferred past this phase** (recorded, not shipped): a native **Camera / Media**
+device picker that publishes a *distinct* getUserMedia second stream, and **live
+auto-rerouting** of already-connected callers via a new director→caller signaling
+message. Both need the wider Path-B plumbing (a second-stream slot independent of
+screenshare, plus a new signaling path) and can only be validated live — deliberately
+out of scope for the "drive the proven machinery" shape chosen for Phase 4.
+
+**Acceptance:** the director designates the composite device shown to callers from
+the UI (screenshare/composite source bar) and hands out a caller link that routes
+to it. **→ Code MET; the live end-to-end validation is the one remaining
+user-owned item.**
 
 ## Phase 5 — Polish, i18n, cache-bust, docs
 
@@ -271,5 +305,7 @@ from the UI if feasible, otherwise via a first-class param + recipe.
    what's currently broadcasting (empty until a caller is live)?
 2. **Group naming / count:** three lanes (On Air / On Deck / Green Room) as drawn,
    or a different set?
-3. **Phase 4 preference if native is feasible:** device-picker in the console, or
-   keep it param-driven for simplicity?
+3. ~~**Phase 4 preference if native is feasible:** device-picker in the console, or
+   keep it param-driven for simplicity?~~ **RESOLVED:** console source bar that
+   drives the proven screenshare `:s` machinery + generates a `&callerview` caller
+   link (native designation UI, existing param routing). See Phase 4.

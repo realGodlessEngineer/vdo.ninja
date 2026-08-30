@@ -41,6 +41,16 @@ const LANE_ACTIONS = [
 	{ cls: "sm-btn--green", group: "green", labelKey: "showmode-action-green", fallback: "To Green Room", scene: false }
 ];
 
+// Phase 4 — caller-facing source. Two states: "none" (no second stream) and
+// "screen" (the composite, published as the director's screenshare :s stream).
+// "screen" is the only publishing option because it rides the existing, proven
+// screenshare machinery; a native camera/media second-stream picker is the wider
+// Path-B work deferred past this phase.
+const SOURCE_OPTS = [
+	{ key: "none", labelKey: "showmode-source-none", fallback: "None" },
+	{ key: "screen", labelKey: "showmode-source-screen", fallback: "Screen / Composite" }
+];
+
 const laneBodies = new Map(); // lane key -> the DOM element boxes live in
 const recentLevels = new Map(); // UUID -> { v, t } most recent core level-bus sample
 const firstSeen = new Map(); // UUID -> performance.now() when the console first saw the guest
@@ -134,6 +144,9 @@ function ensureLanes() {
 	consoleEl.id = "showmodeConsole";
 	consoleEl.className = "sm-console";
 
+	// Phase 4 — the caller-facing source bar sits above the lanes.
+	buildSourceBar(consoleEl);
+
 	laneBodies.clear();
 	LANES.forEach(lane => {
 		const laneEl = document.createElement("section");
@@ -222,6 +235,7 @@ function reconcile() {
 	});
 
 	updateLaneCounts();
+	refreshSourceBar(session);
 }
 
 function isControlBox(el) {
@@ -651,6 +665,218 @@ function formatHold(uuid) {
 	return mins + ":" + (secs < 10 ? "0" + secs : String(secs));
 }
 
+// ---- Phase 4: caller-facing source bar ------------------------------------
+//
+// Designates the composite that callers see, and hands the director the caller
+// invite link. It drives the *existing* screenshare :s machinery
+// (`toggleScreenShare`) to publish the source and reuses the director UI's own
+// guest link (`#director_block_1`) + Phase-1 `&callerview` for routing — so there
+// is no new WebRTC renegotiation and no new signaling path here.
+
+// Build the source bar once, above the lanes. Non-destructive; refreshed each
+// reconcile by refreshSourceBar().
+function buildSourceBar(root) {
+	const bar = document.createElement("div");
+	bar.className = "sm-source";
+
+	const head = document.createElement("div");
+	head.className = "sm-source__head";
+	const title = document.createElement("span");
+	title.className = "sm-source__title";
+	title.textContent = translate("showmode-source-title", "Caller-Facing Source");
+	const sid = document.createElement("span");
+	sid.className = "sm-source__sid";
+	head.appendChild(title);
+	head.appendChild(sid);
+
+	const controls = document.createElement("div");
+	controls.className = "sm-source__controls";
+
+	const opts = document.createElement("div");
+	opts.className = "sm-source__opts";
+	SOURCE_OPTS.forEach(opt => {
+		const btn = document.createElement("button");
+		btn.type = "button";
+		btn.className = "sm-src-btn sm-src-" + opt.key;
+		btn.dataset.src = opt.key;
+		btn.textContent = translate(opt.labelKey, opt.fallback);
+		btn.addEventListener("click", event => {
+			event.preventDefault();
+			event.stopPropagation();
+			setCallerSource(opt.key === "screen");
+			reconcile();
+		});
+		opts.appendChild(btn);
+	});
+
+	const copy = document.createElement("button");
+	copy.type = "button";
+	copy.className = "sm-src-copy";
+	copy.textContent = translate("showmode-source-copy", "Copy caller invite link");
+	copy.addEventListener("click", event => {
+		event.preventDefault();
+		event.stopPropagation();
+		copyCallerLink(copy);
+	});
+
+	controls.appendChild(opts);
+	controls.appendChild(copy);
+
+	const hint = document.createElement("div");
+	hint.className = "sm-source__hint";
+
+	bar.appendChild(head);
+	bar.appendChild(controls);
+	bar.appendChild(hint);
+	root.appendChild(bar);
+}
+
+// The caller-facing source's live stream ID: the director's screenshare :s
+// second stream when one is being published, else empty.
+function callerSourceSid(session) {
+	if (session && session.screenShareState && session.streamID) {
+		return session.streamID + ":s";
+	}
+	return "";
+}
+
+// Publish or stop the caller-facing source by driving the legacy screenshare
+// toggle — gated on the current state so repeated clicks are idempotent (the
+// legacy toggle would otherwise flip it the wrong way).
+function setCallerSource(on) {
+	const session = window.session;
+	if (!session) {
+		return;
+	}
+	if (!!session.screenShareState === on) {
+		return;
+	}
+	if (typeof window.toggleScreenShare !== "function") {
+		console.warn("[showmode] toggleScreenShare unavailable; cannot set caller source");
+		return;
+	}
+	try {
+		window.toggleScreenShare();
+	} catch (error) {
+		console.warn("[showmode] toggleScreenShare failed", error);
+	}
+}
+
+// Caller invite = the director UI's own guest link (which already carries the
+// room, password, token and wss params) + Phase-1 `&callerview=<sid>`. Falls
+// back to a bare room link if the director link block is not present.
+function buildCallerInviteLink(sid) {
+	let base = "";
+	try {
+		const block = document.getElementById("director_block_1");
+		if (block && block.dataset && block.dataset.raw) {
+			base = block.dataset.raw;
+		}
+	} catch (error) {
+		/* fall through to the room-link fallback */
+	}
+	if (!base) {
+		const roomid = window.session && window.session.roomid;
+		if (!roomid) {
+			return "";
+		}
+		base = location.protocol + "//" + location.host + location.pathname + "?room=" + roomid;
+	}
+	const sep = base.indexOf("?") === -1 ? "?" : "&";
+	return base + sep + "callerview=" + sid;
+}
+
+function copyCallerLink(btn) {
+	const sid = callerSourceSid(window.session);
+	if (!sid) {
+		return;
+	}
+	const link = buildCallerInviteLink(sid);
+	if (!link) {
+		return;
+	}
+	const done = () => flashCopied(btn);
+	try {
+		if (navigator.clipboard && navigator.clipboard.writeText) {
+			navigator.clipboard.writeText(link).then(done).catch(() => legacyCopy(link, done));
+		} else {
+			legacyCopy(link, done);
+		}
+	} catch (error) {
+		legacyCopy(link, done);
+	}
+}
+
+// Clipboard fallback for insecure contexts / older browsers.
+function legacyCopy(text, done) {
+	try {
+		const ta = document.createElement("textarea");
+		ta.value = text;
+		ta.style.position = "fixed";
+		ta.style.opacity = "0";
+		document.body.appendChild(ta);
+		ta.select();
+		document.execCommand("copy");
+		document.body.removeChild(ta);
+		if (typeof done === "function") {
+			done();
+		}
+	} catch (error) {
+		console.warn("[showmode] clipboard copy failed", error);
+	}
+}
+
+function flashCopied(btn) {
+	if (!btn) {
+		return;
+	}
+	const original = translate("showmode-source-copy", "Copy caller invite link");
+	btn.textContent = translate("showmode-source-copied", "Copied!");
+	btn.classList.add("sm-src-copied");
+	clearTimeout(btn._smCopyTimer);
+	btn._smCopyTimer = setTimeout(() => {
+		btn.textContent = original;
+		btn.classList.remove("sm-src-copied");
+	}, 1600);
+}
+
+// Keep the bar in sync with the live second-stream state: highlight the active
+// source, show the live sid, enable copy only when a source is publishing, and
+// swap the hint.
+function refreshSourceBar(session) {
+	if (!consoleEl) {
+		return;
+	}
+	const bar = consoleEl.querySelector(":scope > .sm-source");
+	if (!bar) {
+		return;
+	}
+	const live = !!(session && session.screenShareState);
+	const sid = callerSourceSid(session);
+
+	Array.prototype.slice.call(bar.querySelectorAll(".sm-src-btn")).forEach(btn => {
+		const isActive = (btn.dataset.src === "screen") === live;
+		btn.classList.toggle("sm-src-btn--active", isActive);
+	});
+
+	const sidEl = bar.querySelector(".sm-source__sid");
+	if (sidEl) {
+		sidEl.textContent = sid;
+	}
+
+	const copy = bar.querySelector(".sm-src-copy");
+	if (copy && !copy.classList.contains("sm-src-copied")) {
+		copy.disabled = !sid;
+	}
+
+	const hint = bar.querySelector(".sm-source__hint");
+	if (hint) {
+		hint.textContent = live
+			? translate("showmode-source-hint-live", "Callers who open this invite see only this source.")
+			: translate("showmode-source-hint", "Publish a source, then share the caller invite — callers see only it.");
+	}
+}
+
 function injectStyles() {
 	if (document.getElementById("showmode-console-styles")) {
 		return;
@@ -832,5 +1058,93 @@ body.showmode-active #guestFeeds:empty { display: none; }
 #showmodeConsole .sm-pf--ok {
 	opacity: 1;
 	color: #37d67a;
+}
+
+/* Phase 4 — caller-facing source bar (above the lanes). */
+#showmodeConsole .sm-source {
+	border: 1px solid rgba(255, 255, 255, 0.1);
+	border-radius: 8px;
+	background: var(--container-color, #373737);
+	padding: 8px 12px;
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+}
+#showmodeConsole .sm-source__head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+}
+#showmodeConsole .sm-source__title {
+	font-weight: 600;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+	font-size: 0.82em;
+	color: var(--discord-text, #dcddde);
+}
+#showmodeConsole .sm-source__sid {
+	font-family: monospace;
+	font-size: 0.78em;
+	color: var(--discord-text, #dcddde);
+	opacity: 0.75;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	max-width: 55%;
+}
+#showmodeConsole .sm-source__controls {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	justify-content: space-between;
+	gap: 8px;
+}
+#showmodeConsole .sm-source__opts {
+	display: inline-flex;
+	border-radius: 6px;
+	overflow: hidden;
+	border: 1px solid rgba(255, 255, 255, 0.14);
+}
+#showmodeConsole .sm-src-btn {
+	cursor: pointer;
+	border: 0;
+	border-right: 1px solid rgba(255, 255, 255, 0.14);
+	padding: 5px 12px;
+	font-size: 0.76em;
+	font-weight: 600;
+	color: var(--discord-text, #dcddde);
+	background: rgba(255, 255, 255, 0.05);
+	white-space: nowrap;
+}
+#showmodeConsole .sm-src-btn:last-child { border-right: 0; }
+#showmodeConsole .sm-src-btn:hover { background: rgba(255, 255, 255, 0.12); }
+#showmodeConsole .sm-src-btn--active {
+	background: var(--darktheme-red, rgb(161, 45, 45));
+	color: #fff;
+	cursor: default;
+}
+#showmodeConsole .sm-src-copy {
+	cursor: pointer;
+	border: 1px solid rgba(255, 255, 255, 0.18);
+	border-radius: 6px;
+	padding: 5px 12px;
+	font-size: 0.76em;
+	font-weight: 600;
+	color: var(--discord-text, #dcddde);
+	background: rgba(255, 255, 255, 0.06);
+	white-space: nowrap;
+}
+#showmodeConsole .sm-src-copy:hover:not(:disabled) { background: rgba(255, 255, 255, 0.14); }
+#showmodeConsole .sm-src-copy:disabled { opacity: 0.4; cursor: not-allowed; }
+#showmodeConsole .sm-src-copy.sm-src-copied {
+	background: var(--darktheme-green, rgb(36, 88, 49));
+	color: #fff;
+	border-color: var(--darktheme-green, rgb(36, 88, 49));
+}
+#showmodeConsole .sm-source__hint {
+	font-size: 0.72em;
+	color: var(--discord-text, #dcddde);
+	opacity: 0.6;
 }
 `;

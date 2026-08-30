@@ -4,7 +4,7 @@
 // default UI never pays for it. The URL param is the same source main.js reads
 // to set `session.showmode`, so there is no ordering race with main() here.
 
-import { startShowmodeConsole } from "./console.js?v=2";
+import { startShowmodeConsole } from "./console.js?v=3";
 
 const params = new URLSearchParams(window.location.search);
 
