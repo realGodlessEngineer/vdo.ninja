@@ -4229,7 +4229,7 @@ async function main() {
 		}
 	}
 
-	if (urlParams.has("directoronly") || urlParams.has("directorsonly") || urlParams.has("do")) {
+	if (urlParams.has("directoronly") || urlParams.has("directorsonly") || urlParams.has("do") || urlParams.has("callerview")) {
 		session.viewDirectorOnly = true;
 	}
 
@@ -5038,8 +5038,8 @@ async function main() {
 		log(session.excludeaudio);
 	}
 
-	if (urlParams.has("novideo") || urlParams.has("nv") || urlParams.has("hidevideo") || urlParams.has("showonly")) {
-		session.novideo = urlParams.get("novideo") || urlParams.get("nv") || urlParams.get("hidevideo") || urlParams.get("showonly");
+	if (urlParams.has("novideo") || urlParams.has("nv") || urlParams.has("hidevideo") || urlParams.has("showonly") || urlParams.has("callerview")) {
+		session.novideo = urlParams.get("novideo") || urlParams.get("nv") || urlParams.get("hidevideo") || urlParams.get("showonly") || urlParams.get("callerview");
 
 		if (!session.novideo) {
 			session.novideo = [];

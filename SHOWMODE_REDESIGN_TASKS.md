@@ -106,16 +106,40 @@ the module and reads live state through the bridge.
 
 Delivers the working call-in flow using **existing** mechanics — no engine changes.
 
-- [ ] **Caller active-call room:** `&directoronly&showonly=<host program stream id>`.
-      Optionally bundle behind a preset param (e.g. `&callerview`) that expands to
-      the pair, so a caller invite link is short.
-- [ ] **Co-host room:** shared group + `&codirector` + `&showonly=<clean host cam id>`
-      so the co-host sees the clean cam, not the composite (avoids mirror-in-mirror).
-- [ ] Document the stream-ID prerequisite (host publishes a stable ID via `&push=`).
-- [ ] Validate the whole flow live end-to-end (this is the "Path A works today" step).
+- [x] **Caller active-call room** — shipped as a preset param **`&callerview=<host
+      program stream id>`**. It is a *compound alias*: `main.js` adds `callerview`
+      to the `directoronly` block (`main.js:4232` → `session.viewDirectorOnly = true`)
+      **and** to the `showonly`/`novideo` block (`main.js:5041-5042` →
+      `session.novideo = [<id>]`). One short param expands to `&directoronly` +
+      `&showonly=<id>`, so a caller invite link stays short. `?ver=` bumped
+      (index 1066, room 770); `node --check main.js` clean.
+- [x] **Co-host room** — kept as a documented recipe (no new code earns its keep):
+      `&director=<room>&codirector=<password>&showonly=<clean host cam id>`. The
+      co-host joins the director room as a co-director (existing `&codirector`
+      password flow, `main.js:7976`) and `&showonly=<clean cam id>` shows the clean
+      host cam instead of the composite — avoiding mirror-in-mirror. A preset was
+      considered and rejected: the room + password + codirector context can't be
+      folded into a single value param the way the caller side can.
+- [x] Document the stream-ID prerequisite: the host must publish a **stable** stream
+      ID for both the program/composite feed and the clean cam (e.g. via `&push=` or
+      a fixed `&permaid`), because `&callerview` / `&showonly` key off that exact ID.
+- [ ] Validate the whole flow live end-to-end (the "Path A works today" step).
+      **→ USER-OWNED: needs a live host + co-host + caller browser session.**
+
+### Verified allowlist semantics (this session)
+
+`&showonly` is **not** referenced in `lib.js`; `main.js:5042` aliases it straight
+into `session.novideo`. Despite the variable name, a *populated* `session.novideo`
+acts as a video **allowlist**: the display gate at `lib.js:62334` sets `video = false`
+for any peer whose `streamID` is **not** in the array, and audio is governed
+separately (`session.noaudio`). So `&callerview=<id>` shows only the program feed's
+video while the caller still hears the director(s). (An empty `&callerview` with no
+value degrades safely to "all video hidden, audio kept" — hence the stream-ID
+prerequisite above.)
 
 **Acceptance:** a real show can run — caller sees only the program feed + hears both
-hosts; co-host sees clean host cam + self equally; queue stays private.
+hosts; co-host sees clean host cam + self equally; queue stays private. **→ Code +
+recipes MET; the live end-to-end validation is the one remaining user-owned item.**
 
 ## Phase 2 — Director console: lane layout (read-only)
 
