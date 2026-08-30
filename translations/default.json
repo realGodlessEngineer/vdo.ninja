@@ -1,4 +1,7 @@
 {
+  "showmode-lane-onair": "On Air",
+  "showmode-lane-ondeck": "On Deck",
+  "showmode-lane-green": "Green Room",
   "logo-header": "<font id=\"qos\" style=\"color: white;\">O</font>BS.Ninja ",
   "GO": "GO",
   "copy-this-url": "Copy this URL into an OBS \"Browser Source\"",

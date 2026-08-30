@@ -632,6 +632,9 @@
     "enter-room-name-here": "Enter Room name here"
   },
   "miscellaneous": {
+    "showmode-lane-onair": "On Air",
+    "showmode-lane-ondeck": "On Deck",
+    "showmode-lane-green": "Green Room",
     "new-display-name": "Enter a new Display Name for this stream",
     "submit-error-report": "Press OK to submit any error logs to VDO.Ninja. Error logs may contain private information.",
     "director-redirect-1": "The director wishes to redirect you to the URL: ",

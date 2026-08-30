@@ -143,18 +143,48 @@ recipes MET; the live end-to-end validation is the one remaining user-owned item
 
 ## Phase 2 — Director console: lane layout (read-only)
 
-- [ ] Build the lane container (On Air / On Deck / Green Room) as the `&showmode`
-      director view; CSS lifted from the mockup, on `main.css` tokens.
-- [ ] Map **groups → lanes** (each lane backed by a group membership). Define the
-      canonical group names (e.g. `onair`, `ondeck`, `green`).
-- [ ] Render existing per-guest tiles into their lane by group membership instead
-      of the flat list; reuse existing guest controls/markup.
-- [ ] **Status-based coloring** replacing room-color: live (in program/scene),
-      talking (audio-level bus, `core/`), connection quality (existing stats).
-- [ ] Read-only first: correct placement + visual language, no promote/demote yet.
+Shipped as a `core/` ES module (`core/showmode/index.js` + `console.js`), lazy-
+loaded from `podcast/bootstrap.js` only under `&showmode` — no legacy edits, no
+`?ver=` bumps. The module reads live state through `core/legacy/session-bridge.js`
+and the core level bus; the sole legacy hook is `session.showmode` (`main.js:4240`).
+
+- [x] Build the lane container (On Air / On Deck / Green Room) as the `&showmode`
+      director view; CSS injected from the module (scoped to `#showmodeConsole`),
+      on `main.css` tokens (`--container-color`, `--darktheme-red/yellow/green`,
+      `--discord-text`) with literal fallbacks. Lanes carry a live member count.
+- [x] Map **groups → lanes**. **Canonical group names: `onair` / `ondeck` /
+      `green`.** First-match priority `onair > ondeck > green`; a guest in none
+      holds in **Green Room** (default lane).
+- [x] Render existing per-guest tiles into their lane by group membership instead
+      of the flat list; the legacy `container_<UUID>` control boxes are **moved**
+      into lane bodies untouched (markup/controls reused as-is). A MutationObserver
+      on `#guestFeeds` + a 500 ms reconcile loop adopt newly-joined boxes, re-place
+      on a group change, and prune boxes whose peer has left. **On Air anchors:**
+      `container_director` and every co-director (`session.directorList`) are always
+      On Air; the live caller (group `onair`) joins them. Screenshare boxes
+      (`<uuid>_screen`) follow their owner's lane.
+- [x] **Status-based coloring** replacing room-color, painted as non-destructive
+      classes on the box: **talking** (core `levelBus`, falling back to the legacy
+      `voiceMeter.dataset.level > 15` — the reliable director-side signal),
+      **live** (a pressed scene control in the box), **connection quality** (legacy
+      `signalMeter.dataset.level` 0–5 bars → good/warn/bad dot).
+- [x] Read-only first: correct placement + visual language, **no promote/demote**
+      (no `changeGroup()` calls) — that is Phase 3.
+- [x] i18n: `showmode-lane-onair/ondeck/green` added to `translations/default.json`
+      + `en.json` (`miscellaneous`); CI fills other locales. `node --check` clean on
+      both modules; `ci-validateTranslations.js` passes.
+- [ ] Live browser validation: with `&showmode` a real director session shows guests
+      grouped by role with status-driven color, and the default view is unchanged
+      without the flag. **→ USER-OWNED: needs a live director + guests browser
+      session; cannot be verified by code-read.**
 
 **Acceptance:** with `&showmode`, the director sees people grouped by role with
-status-driven color; default view unchanged without the flag.
+status-driven color; default view unchanged without the flag. **→ Code MET; live
+browser validation is the one remaining user-owned item.**
+
+**Known tradeoff (read-only phase):** moving the boxes out of the flat `#guestFeeds`
+disables the legacy in-`#guestFeeds` drag-reorder / slot-lock ordering while
+`&showmode` is active — acceptable for the console view; revisit if Phase 3 needs it.
 
 ## Phase 3 — Director console: promote/demote interactions
 
