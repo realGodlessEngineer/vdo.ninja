@@ -287,15 +287,44 @@ user-owned item.**
 
 ## Phase 5 — Polish, i18n, cache-bust, docs
 
-- [ ] `data-translate` / `getTranslation` keys for all new strings + base
-      translation file entries (CI fills the rest).
-- [ ] Bump `?ver=` for `lib.js` / `main.js` (and any other touched file) in every
-      HTML page that references them.
-- [ ] Prettier pass (tabs width 4, no reflow of long lines).
-- [ ] Update `examples/` / note the new params where user-facing.
+- [x] `data-translate` / `getTranslation` keys for all new strings + base
+      translation file entries (CI fills the rest). **→ Already complete: an audit
+      of `core/showmode/console.js` confirmed every user-facing string (all 18,
+      including the Phase 3 lane buttons and pre-flight indicators) routes through
+      the module's `translate(key, fallback)` helper, and every key is present in
+      **both** `translations/default.json` (flat) and `translations/en.json`
+      (`miscellaneous`). No hardcoded strings, no called-but-missing keys. Nothing
+      to add.**
+- [x] Bump `?ver=` for `lib.js` / `main.js` (and any other touched file) in every
+      HTML page that references them. **→ No legacy `?ver=` debt: Phases 2/3/4 made
+      no `lib.js`/`main.js` edits, and the sole legacy edit (Phase 1's `&callerview`
+      alias in `main.js`) already carried its bump in the same commit (index 1066,
+      room 770). The module cache-bust `?v=` was instead bumped `3 → 4`
+      (`podcast/bootstrap.js` → `index.js?v=4`; `index.js` → `console.js?v=4`)
+      because the prettier pass below touched `console.js`.**
+- [x] Prettier pass (tabs width 4, no reflow of long lines). **→ Ran
+      `npx prettier --write core/showmode/console.js` (`index.js` / `bootstrap.js`
+      were already compliant). Changes were purely cosmetic — double-quote
+      normalization, long lines collapsed to `printWidth: 10000`, and prettier's
+      canonical method-chain break on the clipboard call; no logic touched.
+      `prettier --check` now clean on all three; ES-module syntax OK on all three;
+      `ci-validateTranslations.js` + `ci-checkTranslationKeys.js` pass (0 new
+      missing keys).**
+- [x] Update `examples/` / note the new params where user-facing. **→ No valid
+      in-repo target. The only URL-parameter catalog in the tree is `rawdoc.md`, a
+      snapshot mirror of the external **docs.vdo.ninja** repo, which CLAUDE.md places
+      out of scope ("End-user docs live at docs.vdo.ninja, not in this repo").
+      `examples/` and `iframe.html` document the postMessage/IFRAME API, not
+      view/routing params, so neither is the home for `&showmode` / `&callerview`.
+      End-user docs for the two params belong at docs.vdo.ninja and are tracked as a
+      separate, external follow-up.**
 
 **Acceptance:** production-ready, translation-covered, cache-busted; ready for
-`/ship` up the release tiers.
+`/ship` up the release tiers. **→ Code MET (i18n complete, module cache-busted,
+prettier-clean, translation CI green). Remaining before/after `/ship` are the
+user-owned **live browser validations** carried across Phases 0–4 (group→view
+effect, caller routing, source-bar publish) — browser-only, not code-verifiable —
+and the external docs.vdo.ninja param write-up.**
 
 ---
 

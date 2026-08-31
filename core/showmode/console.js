@@ -342,9 +342,7 @@ function isTalking(uuid, rpc) {
 // scene control inside the box. Absent that UI, no highlight (graceful).
 function isLive(box) {
 	try {
-		return !!box.querySelector(
-			'[data-action-type*="scene"].pressed, [data-action-type*="Scene"].pressed, [data-scene].pressed, [data-action-type*="scene"][data-state="1"], [data-action-type*="Scene"][data-state="1"]'
-		);
+		return !!box.querySelector('[data-action-type*="scene"].pressed, [data-action-type*="Scene"].pressed, [data-scene].pressed, [data-action-type*="scene"][data-state="1"], [data-action-type*="Scene"][data-state="1"]');
 	} catch (error) {
 		return false;
 	}
@@ -382,7 +380,7 @@ function updateLaneCounts() {
 				n += 1;
 			}
 		});
-		const count = consoleEl.querySelector('.sm-lane--' + key + ' .sm-lane__count');
+		const count = consoleEl.querySelector(".sm-lane--" + key + " .sm-lane__count");
 		if (count) {
 			count.textContent = String(n);
 		}
@@ -798,7 +796,10 @@ function copyCallerLink(btn) {
 	const done = () => flashCopied(btn);
 	try {
 		if (navigator.clipboard && navigator.clipboard.writeText) {
-			navigator.clipboard.writeText(link).then(done).catch(() => legacyCopy(link, done));
+			navigator.clipboard
+				.writeText(link)
+				.then(done)
+				.catch(() => legacyCopy(link, done));
 		} else {
 			legacyCopy(link, done);
 		}
@@ -871,9 +872,7 @@ function refreshSourceBar(session) {
 
 	const hint = bar.querySelector(".sm-source__hint");
 	if (hint) {
-		hint.textContent = live
-			? translate("showmode-source-hint-live", "Callers who open this invite see only this source.")
-			: translate("showmode-source-hint", "Publish a source, then share the caller invite — callers see only it.");
+		hint.textContent = live ? translate("showmode-source-hint-live", "Callers who open this invite see only this source.") : translate("showmode-source-hint", "Publish a source, then share the caller invite — callers see only it.");
 	}
 }
 
