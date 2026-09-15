@@ -4240,6 +4240,15 @@ async function main() {
 		session.showmode = true;
 	}
 
+	if (urlParams.has("cohost")) {
+		// Show-mode co-host preset (Phase 6): a compound alias in the spirit of &callerview. The value
+		// is the program feed's stream ID (the director's screenshare :s stream). The co-host joins as a
+		// normal room participant; core/showmode/cohost.js (loaded via podcast/bootstrap.js) pins that
+		// feed large with every other camera in a thumbnail strip, and shows the name / pronouns /
+		// socials form whose details the director console displays. See SHOWMODE_REDESIGN_TASKS.md.
+		session.cohost = urlParams.get("cohost") || true;
+	}
+
 	if (session.view !== false) {
 		session.view_set = session.view.split(",");
 	}

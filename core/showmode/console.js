@@ -51,9 +51,20 @@ const SOURCE_OPTS = [
 	{ key: "screen", labelKey: "showmode-source-screen", fallback: "Screen / Composite" }
 ];
 
+// Phase 6 — invite links the source bar can copy. Both ride the director UI's own
+// guest link (room / password / token / wss already present); the param carries the
+// program feed's stream id so the far side routes to it — callers through the
+// Phase-1 `&callerview` allowlist, co-hosts through the `&cohost` pinned layout.
+const INVITES = {
+	caller: { param: "callerview", copyKey: "showmode-source-copy", copyFallback: "Copy caller invite link" },
+	cohost: { param: "cohost", copyKey: "showmode-cohost-copy", copyFallback: "Copy co-host invite link" }
+};
+const META_LIMITS = { name: 64, pronouns: 32, social: 64, socials: 5 }; // mirrors cohost.js
+
 const laneBodies = new Map(); // lane key -> the DOM element boxes live in
 const recentLevels = new Map(); // UUID -> { v, t } most recent core level-bus sample
 const firstSeen = new Map(); // UUID -> performance.now() when the console first saw the guest
+const metaBySid = new Map(); // streamID -> details a guest shared (survives its rpcs entry being re-created)
 let consoleEl = null;
 let feedObserver = null;
 let reconcileTimer = null;
@@ -77,6 +88,7 @@ export async function startShowmodeConsole() {
 
 	injectStyles();
 	subscribeLevels();
+	hookGenericData(window.session);
 
 	reconcile();
 	reconcileTimer = setInterval(reconcile, RECONCILE_MS);
@@ -432,6 +444,21 @@ function ensureBoxControls(box, session) {
 	const bar = document.createElement("div");
 	bar.className = "sm-actions";
 
+	// Phase 6 — details the guest shared from the co-host card (name / pronouns /
+	// socials). Filled by refreshBoxControls; hidden until something arrives.
+	const metaEl = document.createElement("div");
+	metaEl.className = "sm-meta";
+	metaEl.title = translate("showmode-meta-title", "Details shared by this guest");
+	const metaName = document.createElement("span");
+	metaName.className = "sm-meta__name";
+	const metaPronouns = document.createElement("span");
+	metaPronouns.className = "sm-meta__pronouns";
+	const metaSocials = document.createElement("span");
+	metaSocials.className = "sm-meta__socials";
+	metaEl.appendChild(metaName);
+	metaEl.appendChild(metaPronouns);
+	metaEl.appendChild(metaSocials);
+
 	const detail = document.createElement("div");
 	detail.className = "sm-detail";
 
@@ -488,6 +515,7 @@ function ensureBoxControls(box, session) {
 	});
 	buttons.appendChild(hangupBtn);
 
+	bar.appendChild(metaEl);
 	bar.appendChild(detail);
 	bar.appendChild(buttons);
 	box.appendChild(bar);
@@ -532,6 +560,7 @@ function refreshBoxControls(box, session) {
 	if (cam) {
 		cam.classList.toggle("sm-pf--ok", camLive(box));
 	}
+	renderMeta(bar, metaForRpc(rpc));
 }
 
 // Set a caller's lane group exclusively: add the target group and drop the other
@@ -709,16 +738,36 @@ function buildSourceBar(root) {
 
 	const copy = document.createElement("button");
 	copy.type = "button";
-	copy.className = "sm-src-copy";
-	copy.textContent = translate("showmode-source-copy", "Copy caller invite link");
+	copy.className = "sm-src-copy sm-src-copy--caller";
+	copy.dataset.invite = "caller";
+	copy.textContent = translate(INVITES.caller.copyKey, INVITES.caller.copyFallback);
 	copy.addEventListener("click", event => {
 		event.preventDefault();
 		event.stopPropagation();
-		copyCallerLink(copy);
+		copyInviteLink(copy, "caller");
 	});
 
+	// Phase 6 — the co-host invite pins the program feed large in the co-host's
+	// Zoom-style view; it needs only the director's stream id, not a live source.
+	const copyHost = document.createElement("button");
+	copyHost.type = "button";
+	copyHost.className = "sm-src-copy sm-src-copy--cohost";
+	copyHost.dataset.invite = "cohost";
+	copyHost.textContent = translate(INVITES.cohost.copyKey, INVITES.cohost.copyFallback);
+	copyHost.title = translate("showmode-cohost-copy-hint", "Co-hosts see the program feed large with every camera in a strip above it, and can share their name, pronouns and socials with you.");
+	copyHost.addEventListener("click", event => {
+		event.preventDefault();
+		event.stopPropagation();
+		copyInviteLink(copyHost, "cohost");
+	});
+
+	const links = document.createElement("div");
+	links.className = "sm-source__links";
+	links.appendChild(copy);
+	links.appendChild(copyHost);
+
 	controls.appendChild(opts);
-	controls.appendChild(copy);
+	controls.appendChild(links);
 
 	const hint = document.createElement("div");
 	hint.className = "sm-source__hint";
@@ -729,13 +778,29 @@ function buildSourceBar(root) {
 	root.appendChild(bar);
 }
 
-// The caller-facing source's live stream ID: the director's screenshare :s
-// second stream when one is being published, else empty.
-function callerSourceSid(session) {
-	if (session && session.screenShareState && session.streamID) {
+// The program feed's stream ID: the director's screenshare :s second stream. It
+// is deterministic from the director's own stream id, so a co-host invite can be
+// handed out before the source is publishing.
+function programSid(session) {
+	if (session && session.streamID) {
 		return session.streamID + ":s";
 	}
 	return "";
+}
+
+// The caller-facing source's live stream ID: the program feed while it is being
+// published, else empty (a caller link with no live source would show nothing).
+function callerSourceSid(session) {
+	if (session && session.screenShareState) {
+		return programSid(session);
+	}
+	return "";
+}
+
+// Which stream id an invite of the given kind embeds, or "" if it cannot be
+// built yet.
+function inviteSid(kind, session) {
+	return kind === "cohost" ? programSid(session) : callerSourceSid(session);
 }
 
 // Publish or stop the caller-facing source by driving the legacy screenshare
@@ -760,10 +825,11 @@ function setCallerSource(on) {
 	}
 }
 
-// Caller invite = the director UI's own guest link (which already carries the
-// room, password, token and wss params) + Phase-1 `&callerview=<sid>`. Falls
-// back to a bare room link if the director link block is not present.
-function buildCallerInviteLink(sid) {
+// Invite = the director UI's own guest link (which already carries the room,
+// password, token and wss params) + `&<param>=<sid>` — Phase-1 `&callerview` for
+// callers, Phase-6 `&cohost` for co-hosts. Falls back to a bare room link if the
+// director link block is not present.
+function buildInviteLink(param, sid) {
 	let base = "";
 	try {
 		const block = document.getElementById("director_block_1");
@@ -781,19 +847,20 @@ function buildCallerInviteLink(sid) {
 		base = location.protocol + "//" + location.host + location.pathname + "?room=" + roomid;
 	}
 	const sep = base.indexOf("?") === -1 ? "?" : "&";
-	return base + sep + "callerview=" + sid;
+	return base + sep + param + "=" + encodeURIComponent(sid);
 }
 
-function copyCallerLink(btn) {
-	const sid = callerSourceSid(window.session);
-	if (!sid) {
+function copyInviteLink(btn, kind) {
+	const invite = INVITES[kind];
+	const sid = inviteSid(kind, window.session);
+	if (!invite || !sid) {
 		return;
 	}
-	const link = buildCallerInviteLink(sid);
+	const link = buildInviteLink(invite.param, sid);
 	if (!link) {
 		return;
 	}
-	const done = () => flashCopied(btn);
+	const done = () => flashCopied(btn, invite);
 	try {
 		if (navigator.clipboard && navigator.clipboard.writeText) {
 			navigator.clipboard
@@ -827,11 +894,11 @@ function legacyCopy(text, done) {
 	}
 }
 
-function flashCopied(btn) {
+function flashCopied(btn, invite) {
 	if (!btn) {
 		return;
 	}
-	const original = translate("showmode-source-copy", "Copy caller invite link");
+	const original = translate(invite.copyKey, invite.copyFallback);
 	btn.textContent = translate("showmode-source-copied", "Copied!");
 	btn.classList.add("sm-src-copied");
 	clearTimeout(btn._smCopyTimer);
@@ -865,14 +932,151 @@ function refreshSourceBar(session) {
 		sidEl.textContent = sid;
 	}
 
-	const copy = bar.querySelector(".sm-src-copy");
-	if (copy && !copy.classList.contains("sm-src-copied")) {
-		copy.disabled = !sid;
-	}
+	Array.prototype.slice.call(bar.querySelectorAll(".sm-src-copy")).forEach(copy => {
+		if (!copy.classList.contains("sm-src-copied")) {
+			copy.disabled = !inviteSid(copy.dataset.invite, session);
+		}
+	});
 
 	const hint = bar.querySelector(".sm-source__hint");
 	if (hint) {
 		hint.textContent = live ? translate("showmode-source-hint-live", "Callers who open this invite see only this source.") : translate("showmode-source-hint", "Publish a source, then share the caller invite — callers see only it.");
+	}
+}
+
+// ---- Phase 6: guest details (name / pronouns / socials) ---------------------
+//
+// Co-hosts send their details over the engine's generic data pipe
+// (`session.sendGenericData` on their side; the same path the IFRAME API's
+// `sendData` / `dataReceived` uses). On arrival the engine calls
+// `session.gotGenericData(data, UUID)` — a plain property on the session object —
+// so the console wraps it: absorb `showmodeMeta`, then defer to the original so
+// the IFRAME `dataReceived` event and the chat overlay keep working. No legacy
+// source is touched and no new data channel is opened.
+
+function hookGenericData(session) {
+	if (!session || session._showmodeMetaHooked) {
+		return;
+	}
+	const original = typeof session.gotGenericData === "function" ? session.gotGenericData : null;
+	session.gotGenericData = function (data, uuid) {
+		try {
+			absorbMeta(session, data, uuid);
+		} catch (error) {
+			console.warn("[showmode] could not absorb guest details", error);
+		}
+		if (original) {
+			return original.apply(this, arguments);
+		}
+		return undefined;
+	};
+	session._showmodeMetaHooked = true;
+}
+
+// Store a guest's details on their rpcs entry — found by the sending UUID, or by
+// the stream id the payload carries when the message arrived on a channel the
+// console does not track — and by stream id, so a re-created rpcs entry can be
+// re-populated on the next refresh.
+function absorbMeta(session, data, uuid) {
+	if (!data || typeof data !== "object" || !data.showmodeMeta) {
+		return;
+	}
+	const meta = sanitizeMeta(data.showmodeMeta);
+	let rpc = uuid && session.rpcs ? session.rpcs[uuid] : null;
+	const sid = typeof data.streamID === "string" && data.streamID ? data.streamID : rpc && rpc.streamID;
+	if (!rpc && sid && session.rpcs) {
+		const uuids = Object.keys(session.rpcs);
+		for (let i = 0; i < uuids.length; i++) {
+			if (session.rpcs[uuids[i]] && session.rpcs[uuids[i]].streamID === sid) {
+				rpc = session.rpcs[uuids[i]];
+				break;
+			}
+		}
+	}
+	if (sid) {
+		metaBySid.set(sid, meta);
+	}
+	if (rpc) {
+		rpc.showmodeMeta = meta;
+	}
+}
+
+function metaForRpc(rpc) {
+	if (!rpc) {
+		return null;
+	}
+	if (rpc.showmodeMeta) {
+		return rpc.showmodeMeta;
+	}
+	if (rpc.streamID && metaBySid.has(rpc.streamID)) {
+		rpc.showmodeMeta = metaBySid.get(rpc.streamID);
+		return rpc.showmodeMeta;
+	}
+	return null;
+}
+
+function cleanText(value, max) {
+	if (typeof value !== "string") {
+		return "";
+	}
+	return value
+		.replace(/[\p{Cc}<>]/gu, "")
+		.replace(/\s+/g, " ")
+		.trim()
+		.slice(0, max);
+}
+
+// Normalise a received payload to { name, pronouns, socials[] } with length caps
+// and no markup — the guest sanitises too, but the wire is not trusted.
+function sanitizeMeta(raw) {
+	const src = raw && typeof raw === "object" ? raw : {};
+	let socials = [];
+	if (Array.isArray(src.socials)) {
+		socials = src.socials;
+	} else if (typeof src.socials === "string") {
+		socials = src.socials.split(",");
+	}
+	socials = socials
+		.map(handle => cleanText(handle, META_LIMITS.social))
+		.filter(Boolean)
+		.slice(0, META_LIMITS.socials);
+	return { name: cleanText(src.name, META_LIMITS.name), pronouns: cleanText(src.pronouns, META_LIMITS.pronouns), socials };
+}
+
+// Paint the details row in the box's action bar; text-only (no markup), and the
+// social chips are only rebuilt when they change.
+function renderMeta(bar, meta) {
+	const el = bar.querySelector(":scope > .sm-meta");
+	if (!el) {
+		return;
+	}
+	const has = !!(meta && (meta.name || meta.pronouns || (meta.socials && meta.socials.length)));
+	el.classList.toggle("sm-meta--on", has);
+	if (!has) {
+		return;
+	}
+	const name = el.querySelector(".sm-meta__name");
+	if (name) {
+		name.textContent = meta.name || "";
+	}
+	const pronouns = el.querySelector(".sm-meta__pronouns");
+	if (pronouns) {
+		pronouns.textContent = meta.pronouns || "";
+	}
+	const socials = el.querySelector(".sm-meta__socials");
+	if (socials) {
+		const handles = Array.isArray(meta.socials) ? meta.socials : [];
+		const key = handles.join("\n");
+		if (socials.dataset.rendered !== key) {
+			socials.dataset.rendered = key;
+			socials.textContent = "";
+			handles.forEach(handle => {
+				const chip = document.createElement("span");
+				chip.className = "sm-meta__social";
+				chip.textContent = handle;
+				socials.appendChild(chip);
+			});
+		}
 	}
 }
 
@@ -1145,5 +1349,47 @@ body.showmode-active #guestFeeds:empty { display: none; }
 	font-size: 0.72em;
 	color: var(--discord-text, #dcddde);
 	opacity: 0.6;
+}
+
+/* Phase 6 — the co-host invite beside the caller invite, and the details a guest
+   shared (name / pronouns / socials) as the first row of the action bar. */
+#showmodeConsole .sm-source__links {
+	display: inline-flex;
+	flex-wrap: wrap;
+	gap: 6px;
+}
+#showmodeConsole .sm-src-copy--cohost { border-color: rgba(120, 170, 255, 0.45); }
+#showmodeConsole .sm-meta {
+	display: none;
+	flex-basis: 100%;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 4px 8px;
+	padding: 2px 2px 5px;
+	border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+	color: var(--discord-text, #dcddde);
+	font-size: 0.74em;
+	line-height: 1.35;
+}
+#showmodeConsole .sm-meta.sm-meta--on { display: flex; }
+#showmodeConsole .sm-meta__name {
+	font-weight: 700;
+	font-size: 1.1em;
+}
+#showmodeConsole .sm-meta__pronouns { opacity: 0.7; }
+#showmodeConsole .sm-meta__pronouns:empty { display: none; }
+#showmodeConsole .sm-meta__socials {
+	display: inline-flex;
+	flex-wrap: wrap;
+	gap: 4px;
+}
+#showmodeConsole .sm-meta__social {
+	padding: 0 7px;
+	border-radius: 999px;
+	border: 1px solid rgba(255, 255, 255, 0.14);
+	background: rgba(255, 255, 255, 0.07);
+	font-family: monospace;
+	font-size: 0.95em;
+	white-space: nowrap;
 }
 `;

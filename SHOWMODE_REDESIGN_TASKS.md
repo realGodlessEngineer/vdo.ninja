@@ -120,6 +120,10 @@ Delivers the working call-in flow using **existing** mechanics — no engine cha
       host cam instead of the composite — avoiding mirror-in-mirror. A preset was
       considered and rejected: the room + password + codirector context can't be
       folded into a single value param the way the caller side can.
+      **→ Superseded in Phase 6 by the `&cohost=<program sid>` preset ("Option
+      A": the co-host is a normal participant with a Zoom-style view, not a
+      co-director). The co-director recipe remains valid for a co-host who needs
+      director controls.**
 - [x] Document the stream-ID prerequisite: the host must publish a **stable** stream
       ID for both the program/composite feed and the clean cam (e.g. via `&push=` or
       a fixed `&permaid`), because `&callerview` / `&showonly` key off that exact ID.
@@ -325,6 +329,85 @@ prettier-clean, translation CI green). Remaining before/after `/ship` are the
 user-owned **live browser validations** carried across Phases 0–4 (group→view
 effect, caller routing, source-bar publish) — browser-only, not code-verifiable —
 and the external docs.vdo.ninja param write-up.**
+
+## Phase 6 — Co-host view, co-host invite, guest details
+
+The user chose **"Option A"** for co-hosts: they join as a **normal room
+participant** (publish cam + mic, heard as a host) — *not* as a co-director — and
+get a **Zoom-style view**. Shipped as one new compound param, one new `core/`
+module, and console extensions; module cache-bust bumped `4 → 5`
+(`podcast/bootstrap.js` → `index.js?v=5`; `index.js` → `console.js?v=5` /
+`cohost.js?v=5`). `main.js` gained a single flag block (`?ver=` bumped: index
+1067, room 771). `lib.js` and `webrtc.js` untouched.
+
+- [x] **`&cohost=<program stream id>` preset.** `main.js` (after the `&showmode`
+      block) sets `session.cohost = <value> || true`; that is the only legacy hook.
+      The value is the program feed's stream id — the director's screenshare `:s`
+      stream, the same `session.streamID + ":s"` the Phase-4 source bar computes.
+      The page must be `index.html` (it loads `podcast/bootstrap.js`); `room.html`
+      does not load the module and simply shows the default guest view.
+- [x] **Zoom-style layout** (`core/showmode/cohost.js`): the program feed pinned
+      large below an 18 %-tall strip of thumbnails across the top (self first, the
+      director's own cam next, then callers / other co-hosts in arrival order; up to
+      8 thumbs, centred, ≤ 18 % wide each). **Why the layout is built at runtime
+      rather than fixed in the URL:** `updateMixer` only draws streams that
+      `session.layout` keys *explicitly* — un-keyed streams are hidden
+      (`lib.js:8873`), and plain `layout[""]` entries without `iframeSrc` /
+      media / `defaultStreamID` are skipped (`lib.js:8780`) — so a static
+      `&layout` cannot express "everyone else". The module keys every live-video
+      stream itself and re-applies via the legacy `updateMixer()` only when the
+      set changes. Keying the guest's own `session.streamID` makes the legacy code
+      fold the self-preview into the layout instead of the floating mini-preview
+      (`lib.js:7223`). Until the program feed is present (or if the param value is
+      empty and no `:s` stream is in the room) the default grid is left alone, so
+      co-hosts see each other normally before the show starts.
+- [x] **Copy co-host invite link** on the console source bar, beside the caller
+      invite: `#director_block_1` `dataset.raw` + `&cohost=<sid>`. Unlike the
+      caller button it is enabled as soon as the director's stream id is known —
+      the co-host view degrades to the grid until the feed publishes, so the link
+      can go out before the show.
+- [x] **Guest details card** (`cohost.js`): display name (required), pronouns,
+      social handle(s) (comma-separated, ≤ 5). Bottom-left card that collapses to a
+      status pill ("Shared with the host" / "Will share when the host connects");
+      remembered per browser (`localStorage`), name prefilled from `&label`.
+- [x] **Transport — cloned from the label pattern, on the engine's generic pipe.**
+      The `changeLabel` *send* is in `lib.js` but its *receive* is inside
+      `webrtc.js` (off-limits) and unknown message keys are dropped there, so a new
+      `sendMessage` field would never surface. The engine already exposes a
+      generic pipe: `session.sendGenericData(data, UUID, streamID, type)` (wraps
+      `sendMessage` / `sendRequest` / `sendPeers`; it is what the IFRAME API's
+      `sendData` uses) arriving as `session.gotGenericData(data, UUID)` — a plain
+      property on the session object. The guest sends
+      `{ showmodeMeta: { name, pronouns, socials }, streamID }` with `type: "pcs"`
+      (its viewers, which include the director), on save, when a new viewer
+      appears (+ a 3 s settle re-send) and every 20 s. The console **wraps**
+      `session.gotGenericData`: it stores the sanitised payload on
+      `session.rpcs[UUID].showmodeMeta` (matching by UUID, or by the carried
+      stream id when the message lands on a channel the console does not track),
+      then defers to the original so the IFRAME `dataReceived` event and chat
+      overlay keep working. Both sides strip markup/control chars and cap lengths;
+      rendering is `textContent` only.
+- [x] **Console rendering:** a `.sm-meta` row (name · pronouns · social chips) at
+      the top of each guest box's action bar, hidden until details arrive.
+- [x] i18n: 17 new `showmode-cohost-*` / `showmode-meta-title` keys in
+      `translations/default.json` + `en.json` (`miscellaneous`); CI fills other
+      locales. `ci-validateTranslations.js` + `ci-checkTranslationKeys.js` pass.
+- [ ] Live browser validation. **→ USER-OWNED:** (1) with the director publishing
+      the composite, a co-host opening the copied link sees it large with the
+      strip on top, and the grid before it publishes; (2) the strip reflows as
+      callers join/leave; (3) details saved on the co-host page appear in that
+      guest's box on the `&showmode` console (and survive a director reload);
+      (4) the copied link opens the right room with the right pass/token.
+
+**Not done / follow-ups:** the guest's display name is *not* mirrored into the
+legacy label (`session.label` + `changeLabel`) — the only in-repo sender of that
+message is the director's own box, and its receive semantics are inside
+`webrtc.js`, so it was left alone; revisit if the name should also drive OBS
+`&showlabels`. The `"pcs"` route selector was inferred from the obfuscated
+`sendGenericData` (`'rpcs'` → `sendRequest`, one literal → `sendMessage`, else
+`sendPeers`); if the literal is not `"pcs"` the call falls through to
+`sendPeers`, which still reaches the director — the stream-id fallback on the
+console covers either channel.
 
 ---
 
