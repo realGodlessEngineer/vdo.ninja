@@ -9,5 +9,5 @@ if (studioMode) {
 }
 
 if (showMode || coHost) {
-	import("../core/showmode/index.js?v=5");
+	import("../core/showmode/index.js?v=6");
 }

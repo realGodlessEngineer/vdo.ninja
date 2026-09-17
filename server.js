@@ -123,7 +123,12 @@ const config = {
 	// only on the first deploy or after the pinned version is bumped; off by
 	// default so a plain static-client forker never unexpectedly downloads the
 	// model set.
-	installSegmentationAssets: process.env.INSTALL_LONGPIPE_ASSETS === "true"
+	installSegmentationAssets: process.env.INSTALL_LONGPIPE_ASSETS === "true",
+	// Opt-in (show system): when "true", register the in-memory per-room
+	// guest-queue routes below (POST/GET /api/showmode/queue and the unload
+	// beacon). Off by default so a plain forker never grows a stateful endpoint;
+	// mirrors DIRECTOR_SECRET/RATE_LIMIT_RPM in being a single-read env gate.
+	showmodeQueue: process.env.SHOWMODE_QUEUE === "true"
 };
 
 try {
@@ -173,6 +178,13 @@ const RATE_LIMIT_ENABLED = config.rateLimitRpm > 0;
 if (process.env.RATE_LIMIT_RPM !== undefined && process.env.RATE_LIMIT_RPM.trim() !== "" && !RATE_LIMIT_ENABLED) {
 	console.warn(`Ignoring RATE_LIMIT_RPM=${JSON.stringify(process.env.RATE_LIMIT_RPM)}: must be a positive integer (requests per minute, per IP) to enable the rate limiter.`);
 }
+
+// Show-mode guest-queue endpoint (SHOWMODE_QUEUE=true). Computed here alongside
+// THEME_NAME/DIRECTOR_ENABLED/RATE_LIMIT_ENABLED so every "is this optional
+// feature on" flag lives in one place. When false the routes + store + sweep
+// below are never registered, so the feature is genuinely absent (zero behavior
+// change for a forker who never opts in) -- the same posture as /director.
+const QUEUE_ENABLED = config.showmodeQueue;
 
 // gzip responses. lib.js (~2MB) and webrtc.js (~700KB) compress dramatically.
 app.use(compression());
@@ -596,6 +608,203 @@ if (DIRECTOR_ENABLED) {
 			location += `#${fragmentParams.join("&")}`;
 		}
 		res.redirect(302, location);
+	});
+}
+
+// ---------------------------------------------------------------------------
+// Show-mode guest queue (opt-in: SHOWMODE_QUEUE=true).
+// ---------------------------------------------------------------------------
+// A hand-rolled, in-memory, per-room queue of the guests who have "queued up"
+// through the &intake modal (see core/showmode/intake.js). Each guest's own
+// browser POSTs its details on submit; "our system" (or a director dashboard)
+// GETs the current queue for a room. This process is otherwise stateless, so
+// this store is intentionally ephemeral -- it evaporates on restart and is not
+// shared across instances, which is fine: the guests re-POST on their next
+// join, and the TTL sweep + unload beacon keep it from growing without bound.
+//
+// Registered inside `if (QUEUE_ENABLED)` and BEFORE the static/deny-list/SPA
+// middleware below, so when the feature is off the routes simply don't exist
+// (POST 404s; a GET with an API Accept header 404s too), and when it's on these
+// win over the file handlers. Reuses the same idioms as the F22 rate limiter:
+// touchBounded() to bound both maps, and an .unref()ed setInterval sweep.
+if (QUEUE_ENABLED) {
+	// Per-entry lifetime and the two hard caps. A guest record older than this
+	// (measured from its last update) is reaped by the sweep; a room whose inner
+	// map empties is dropped so stale room keys don't accumulate.
+	const QUEUE_TTL_MS = 12 * 60 * 60 * 1000; // 12h since updatedAt
+	const QUEUE_SWEEP_MS = 30 * 60 * 1000; // sweep cadence -- far coarser than the TTL, this is just GC
+	const QUEUE_MAX_ROOMS = 5000; // hard ceiling on distinct rooms held at once
+	const QUEUE_MAX_GUESTS_PER_ROOM = 500; // hard ceiling on guests per room
+
+	// Length caps, applied after trimming. room/streamID are the identity keys
+	// (kept generous); the display fields are capped tighter so one guest can't
+	// bloat a room listing. These mirror the client-side caps in
+	// core/showmode/intake.js but are re-enforced here because the wire is not
+	// trusted.
+	const FIELD_CAPS = { room: 128, streamID: 128, name: 64, pronouns: 40, religiousPosition: 80, topic: 200 };
+
+	// roomNorm -> Map<streamID, record>. record:
+	//   { streamID, name, pronouns, religiousPosition, topic, joinedAt, updatedAt }
+	const queueRooms = new Map();
+
+	// Canonical room key: trim, then cap. Case is PRESERVED on purpose -- VDO.Ninja
+	// room names are case-sensitive (lib.js sanitizeRoomName does not lowercase), so
+	// "MyShow" and "myshow" are genuinely different rooms and must not share a queue;
+	// folding them would return the wrong list and cross-leak one room's guest PII
+	// into the other. The SAME transform is applied on POST, GET, and leave so all
+	// three agree on the key; the cap runs last so an over-long room can't normalize
+	// to a value the others miss.
+	function roomKey(raw) {
+		if (typeof raw !== "string") {
+			return "";
+		}
+		return raw.trim().slice(0, FIELD_CAPS.room);
+	}
+
+	// Trim then hard-cap a free-text field; a non-string coerces to "".
+	function trimCap(value, cap) {
+		if (typeof value !== "string") {
+			return "";
+		}
+		return value.trim().slice(0, cap);
+	}
+
+	// Upsert a guest under (roomNorm, streamID). A re-POST keeps the original
+	// joinedAt (so queue order is stable) and only refreshes the mutable fields +
+	// updatedAt. touchBounded() both bounds each map and refreshes LRU recency, so
+	// under a flood the entry evicted is always the least-recently-touched one.
+	function upsertGuest(roomNorm, incoming) {
+		let guests = queueRooms.get(roomNorm);
+		if (!guests) {
+			guests = new Map();
+		}
+		// Refresh (or insert) the room's recency and bound the room count.
+		touchBounded(queueRooms, roomNorm, guests, QUEUE_MAX_ROOMS);
+
+		const now = Date.now();
+		const existing = guests.get(incoming.streamID);
+		const record = {
+			streamID: incoming.streamID,
+			name: incoming.name,
+			pronouns: incoming.pronouns,
+			religiousPosition: incoming.religiousPosition,
+			topic: incoming.topic,
+			joinedAt: existing ? existing.joinedAt : now,
+			updatedAt: now
+		};
+		touchBounded(guests, incoming.streamID, record, QUEUE_MAX_GUESTS_PER_ROOM);
+		return record;
+	}
+
+	// Proactively drop aged-out guests (and then empty rooms). Same .unref()ed
+	// sweep shape as F22's rate limiter -- required so this timer can never keep
+	// the event loop alive on its own and interfere with the graceful-drain path.
+	const queueSweep = setInterval(() => {
+		const cutoff = Date.now() - QUEUE_TTL_MS;
+		for (const [roomNorm, guests] of queueRooms) {
+			for (const [sid, record] of guests) {
+				if (record.updatedAt < cutoff) {
+					guests.delete(sid);
+				}
+			}
+			if (guests.size === 0) {
+				queueRooms.delete(roomNorm);
+			}
+		}
+	}, QUEUE_SWEEP_MS);
+	queueSweep.unref();
+
+	// express.json is applied as ROUTE-LEVEL middleware (never app.use) so only
+	// these endpoints parse a JSON body; everything else in this static file
+	// server stays body-parser-free. The 8kb limit is generous for the handful of
+	// short fields but small enough to be a cheap abuse backstop.
+	const parseQueueBody = express.json({ limit: "8kb" });
+
+	// Strict wrapper for the POST: an oversized/malformed body would otherwise
+	// reach the final error handler at the bottom of this file, which renders a
+	// generic 500 -- turn it into an honest 400 here instead.
+	function queueBodyParser(req, res, next) {
+		parseQueueBody(req, res, err => {
+			if (err) {
+				return sendError(req, res, 400, "Bad request", "The request body was missing, malformed, or too large.");
+			}
+			next();
+		});
+	}
+
+	// Lenient wrapper for the unload beacon: navigator.sendBeacon may deliver a
+	// Blob (application/json) or, on some paths, text/plain -- and a page being
+	// torn down can't observe the response anyway. Swallow any parse error and
+	// proceed; the handler treats an unparseable body as "nothing to remove".
+	function queueLeaveParser(req, res, next) {
+		parseQueueBody(req, res, () => next());
+	}
+
+	// POST /api/showmode/queue -- a guest announces (or re-announces) itself.
+	app.post("/api/showmode/queue", queueBodyParser, (req, res) => {
+		const body = req.body && typeof req.body === "object" ? req.body : {};
+		const room = roomKey(body.room);
+		const streamID = trimCap(body.streamID, FIELD_CAPS.streamID);
+		if (!room || !streamID) {
+			return sendError(req, res, 400, "Bad request", "Both room and streamID are required.");
+		}
+		upsertGuest(room, {
+			streamID,
+			name: trimCap(body.name, FIELD_CAPS.name),
+			pronouns: trimCap(body.pronouns, FIELD_CAPS.pronouns),
+			religiousPosition: trimCap(body.religiousPosition, FIELD_CAPS.religiousPosition),
+			topic: trimCap(body.topic, FIELD_CAPS.topic)
+		});
+		res.json({ ok: true });
+	});
+
+	// GET /api/showmode/queue?room=<room> -- list a room's current queue, oldest
+	// first. The cross-origin GET is already covered by the global
+	// Access-Control-Allow-Origin:* header set near the top of this file.
+	//
+	// TODO: token-gate this (mirror the F18 Basic-auth pattern) before exposing
+	// publicly -- an unauthenticated reader can currently enumerate a room's guest
+	// list (names/pronouns/positions/topics) if they know the room name.
+	app.get("/api/showmode/queue", (req, res) => {
+		const room = roomKey(req.query.room);
+		if (!room) {
+			return sendError(req, res, 400, "Bad request", "A non-empty ?room= query parameter is required.");
+		}
+		const guests = queueRooms.get(room);
+		const list = guests ? [...guests.values()] : [];
+		list.sort((a, b) => a.joinedAt - b.joinedAt);
+		res.json({
+			room,
+			count: list.length,
+			guests: list.map(g => ({
+				streamID: g.streamID,
+				name: g.name,
+				pronouns: g.pronouns,
+				religiousPosition: g.religiousPosition,
+				topic: g.topic,
+				joinedAt: g.joinedAt,
+				updatedAt: g.updatedAt
+			}))
+		});
+	});
+
+	// POST /api/showmode/queue/leave -- best-effort removal for the unload beacon.
+	// Idempotent: 200 whether or not the entry existed. The TTL sweep is the real
+	// cleanup; this just tidies the list sooner when a guest closes the tab.
+	app.post("/api/showmode/queue/leave", queueLeaveParser, (req, res) => {
+		const body = req.body && typeof req.body === "object" ? req.body : {};
+		const room = roomKey(body.room);
+		const streamID = trimCap(body.streamID, FIELD_CAPS.streamID);
+		if (room && streamID) {
+			const guests = queueRooms.get(room);
+			if (guests) {
+				guests.delete(streamID);
+				if (guests.size === 0) {
+					queueRooms.delete(room);
+				}
+			}
+		}
+		res.json({ ok: true });
 	});
 }
 

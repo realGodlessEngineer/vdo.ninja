@@ -3586,7 +3586,45 @@ async function main() {
 		session.labelsize = parseInt(session.labelsize);
 	}
 
-	if (urlParams.has("label") || urlParams.has("l")) {
+	if (urlParams.has("intake")) {
+		// &intake (show system): one combined guest-intake modal — Name / Pronouns /
+		// Religious Position / Topic — shown instead of the plain display-name prompt.
+		// It blocks here (before the publish gate) exactly like the prompt it
+		// supersedes. The network side (announce to the director console + POST to the
+		// queue endpoint) is deferred to the &intake block far below, after
+		// session.roomid / session.streamID are finalized — at this point session.roomid
+		// is not yet assigned, so a POST here would carry a stale key.
+		let intakeInfo = null;
+		try {
+			const mod = await import("./core/showmode/intake.js?v=1");
+			intakeInfo = await mod.collectGuestIntake(session);
+		} catch (e) {
+			errorlog(e);
+		}
+		if (intakeInfo && intakeInfo.name) {
+			session.label = sanitizeLabel(intakeInfo.name);
+			document.title = session.label;
+			updateURL("label=" + encodeURIComponent(session.label), true, false);
+
+			// Populate session.meta in the existing {type,label,templateName,value,id}
+			// shape (see the &meta block below) so existing meta consumers keep working.
+			if (!session.meta) {
+				session.meta = {};
+			}
+			if (intakeInfo.pronouns) {
+				session.meta.pronouns = { type: "text", label: "Pronouns", templateName: "pronouns", value: intakeInfo.pronouns, id: "1" };
+			}
+			if (intakeInfo.religiousPosition) {
+				session.meta.religion = { type: "text", label: "Religious Position", templateName: "religion", value: intakeInfo.religiousPosition, id: "2" };
+			}
+			if (intakeInfo.topic) {
+				session.meta.topic = { type: "text", label: "Topic", templateName: "topic", value: intakeInfo.topic, id: "3" };
+			}
+
+			// Hand off to the deferred announce + POST below.
+			session.intakeInfo = intakeInfo;
+		}
+	} else if (urlParams.has("label") || urlParams.has("l")) {
 		session.label = urlParams.get("label") || urlParams.get("l") || null;
 		var updateURLAsNeed = true;
 		if (session.label == null || session.label.length == 0) {
@@ -7220,6 +7258,50 @@ async function main() {
 			document.getElementById("webcamquality").elements.namedItem("resolution").value = session.quality_wb || 0;
 			document.getElementById("webcamquality3").elements.namedItem("resolution").value = session.quality_wb || 0;
 		} catch(e){}
+	}
+
+	if (session.intakeInfo) {
+		// &intake network side (the modal ran far above at the name-collection
+		// point). Deferred to here on purpose: session.roomid and session.streamID
+		// are only finalized just above, so this is the first point where the queue
+		// keys are correct. Everything here is best-effort and must never block or
+		// break publishing.
+		var intake = session.intakeInfo;
+		var intakeRoom = session.roomid || "";
+		var intakeStreamID = session.streamID || "";
+
+		// Mirror the Phase 6 co-host pipe so the director console can render the
+		// details (core/showmode/console.js absorbs `showmodeMeta`). No viewers may
+		// be connected yet, so this is best-effort; the server queue below is the
+		// reliable sink.
+		try {
+			if (typeof session.sendGenericData === "function") {
+				session.sendGenericData({ showmodeMeta: { name: intake.name, pronouns: intake.pronouns, religiousPosition: intake.religiousPosition, topic: intake.topic }, streamID: intakeStreamID }, false, false, "pcs");
+			}
+		} catch (e) {
+			errorlog(e);
+		}
+
+		// POST to the same-origin queue endpoint (server.js, gated on SHOWMODE_QUEUE)
+		// so "our system" can list the room's queue. Non-fatal on any failure.
+		if (intakeRoom && intakeStreamID) {
+			try {
+				fetch("/api/showmode/queue", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ room: intakeRoom, streamID: intakeStreamID, name: intake.name, pronouns: intake.pronouns, religiousPosition: intake.religiousPosition, topic: intake.topic }) }).catch(function (e) { errorlog(e); });
+			} catch (e) {}
+
+			// Best-effort removal when the guest closes the tab. The server TTL is the
+			// real cleanup; this just tidies the list sooner.
+			var intakeLeaveBody = JSON.stringify({ room: intakeRoom, streamID: intakeStreamID });
+			var sendIntakeLeave = function () {
+				try {
+					if (navigator.sendBeacon) {
+						navigator.sendBeacon("/api/showmode/queue/leave", new Blob([intakeLeaveBody], { type: "application/json" }));
+					}
+				} catch (e) {}
+			};
+			window.addEventListener("pagehide", sendIntakeLeave);
+			window.addEventListener("beforeunload", sendIntakeLeave);
+		}
 	}
 
 	if (session.permaid === false && session.roomid === false && session.view === false && session.effect === false && session.director === false) {

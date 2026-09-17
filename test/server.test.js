@@ -737,3 +737,175 @@ test("F-C: HSTS_INCLUDE_SUBDOMAINS=true appends includeSubDomains to the Strict-
 	const res = await request(hstsApp).get("/healthz");
 	assert.equal(res.headers["strict-transport-security"], "max-age=15552000; includeSubDomains");
 });
+
+// ---------------------------------------------------------------------------
+// Show-mode guest queue (opt-in: SHOWMODE_QUEUE=true).
+// ---------------------------------------------------------------------------
+// Same hermetic pattern as loadThemedApp()/loadDirectorApp()/loadRateLimitedApp()
+// above: server.js reads SHOWMODE_QUEUE into its `config` exactly once at require
+// time and only registers the queue routes when it's "true". The top-level `app`
+// was required with it unset, so the routes are absent on it -- reused directly by
+// the "feature off" test below. loadQueueApp() builds a fresh instance with the
+// env var set hermetically: snapshot the cached module, set/delete the env var,
+// re-require server.js so it re-reads it, then restore both the env and the
+// original cached module so the rest of the suite is untouched.
+const QUEUE_ENV_KEYS = ["SHOWMODE_QUEUE"];
+
+function loadQueueApp(env) {
+	const serverPath = require.resolve("../server");
+	const originalModule = require.cache[serverPath];
+	const saved = {};
+	for (const key of QUEUE_ENV_KEYS) {
+		saved[key] = key in process.env ? process.env[key] : undefined;
+		if (env[key] === undefined) delete process.env[key];
+		else process.env[key] = env[key];
+	}
+
+	delete require.cache[serverPath];
+	const queueApp = require("../server");
+
+	for (const key of QUEUE_ENV_KEYS) {
+		if (saved[key] === undefined) delete process.env[key];
+		else process.env[key] = saved[key];
+	}
+	require.cache[serverPath] = originalModule;
+
+	return queueApp;
+}
+
+test("SHOWMODE_QUEUE: POST then GET round-trips a guest record for the right room", async () => {
+	const queueApp = loadQueueApp({ SHOWMODE_QUEUE: "true" });
+	const post = await request(queueApp).post("/api/showmode/queue").send({ room: "greenroom", streamID: "sid-a", name: "Ada", pronouns: "she/her", religiousPosition: "Atheist", topic: "The problem of evil" });
+	assert.equal(post.status, 200);
+	assert.equal(post.body.ok, true);
+
+	const get = await request(queueApp).get("/api/showmode/queue?room=greenroom").set("Accept", "application/json");
+	assert.equal(get.status, 200);
+	assert.match(get.headers["content-type"], /json/);
+	assert.equal(get.body.room, "greenroom");
+	assert.equal(get.body.count, 1);
+	assert.equal(get.body.guests.length, 1);
+	const guest = get.body.guests[0];
+	assert.equal(guest.streamID, "sid-a");
+	assert.equal(guest.name, "Ada");
+	assert.equal(guest.pronouns, "she/her");
+	assert.equal(guest.religiousPosition, "Atheist");
+	assert.equal(guest.topic, "The problem of evil");
+	assert.equal(typeof guest.joinedAt, "number");
+	assert.equal(typeof guest.updatedAt, "number");
+
+	// Room identity is case-SENSITIVE: VDO.Ninja room names are case-sensitive, so a
+	// differently-cased ?room= is a distinct, separate bucket -- "GreenRoom" must NOT
+	// return the guest who POSTed "greenroom" (folding them would cross-leak PII).
+	const getMixedCase = await request(queueApp).get("/api/showmode/queue?room=GreenRoom").set("Accept", "application/json");
+	assert.equal(getMixedCase.status, 200);
+	assert.equal(getMixedCase.body.count, 0);
+	assert.equal(getMixedCase.body.guests.length, 0);
+
+	// A different room is a separate, empty queue.
+	const other = await request(queueApp).get("/api/showmode/queue?room=otherroom").set("Accept", "application/json");
+	assert.equal(other.status, 200);
+	assert.equal(other.body.count, 0);
+	assert.equal(other.body.guests.length, 0);
+});
+
+test("SHOWMODE_QUEUE: two distinct streamIDs in one room list as two guests, oldest first", async () => {
+	const queueApp = loadQueueApp({ SHOWMODE_QUEUE: "true" });
+	await request(queueApp).post("/api/showmode/queue").send({ room: "r", streamID: "sid-1", name: "First" });
+	await new Promise(resolve => setTimeout(resolve, 5)); // keep joinedAt strictly ordered
+	await request(queueApp).post("/api/showmode/queue").send({ room: "r", streamID: "sid-2", name: "Second" });
+
+	const get = await request(queueApp).get("/api/showmode/queue?room=r").set("Accept", "application/json");
+	assert.equal(get.status, 200);
+	assert.equal(get.body.count, 2);
+	assert.equal(get.body.guests[0].streamID, "sid-1");
+	assert.equal(get.body.guests[1].streamID, "sid-2");
+	assert.ok(get.body.guests[0].joinedAt <= get.body.guests[1].joinedAt);
+});
+
+test("SHOWMODE_QUEUE: a re-POST upserts -- count stays 1, joinedAt preserved, updatedAt advances", async () => {
+	const queueApp = loadQueueApp({ SHOWMODE_QUEUE: "true" });
+	await request(queueApp).post("/api/showmode/queue").send({ room: "r", streamID: "sid-x", name: "Before", topic: "old" });
+	const first = await request(queueApp).get("/api/showmode/queue?room=r").set("Accept", "application/json");
+	const before = first.body.guests[0];
+
+	await new Promise(resolve => setTimeout(resolve, 25)); // guarantee a later Date.now() ms
+	await request(queueApp).post("/api/showmode/queue").send({ room: "r", streamID: "sid-x", name: "After", topic: "new" });
+	const second = await request(queueApp).get("/api/showmode/queue?room=r").set("Accept", "application/json");
+	assert.equal(second.body.count, 1);
+	const after = second.body.guests[0];
+	assert.equal(after.name, "After");
+	assert.equal(after.topic, "new");
+	assert.equal(after.joinedAt, before.joinedAt); // original queue position preserved
+	assert.ok(after.updatedAt > before.updatedAt); // refreshed
+});
+
+test("SHOWMODE_QUEUE: a missing or blank room/streamID on POST is a 400", async () => {
+	const queueApp = loadQueueApp({ SHOWMODE_QUEUE: "true" });
+	const noRoom = await request(queueApp).post("/api/showmode/queue").send({ streamID: "sid" });
+	assert.equal(noRoom.status, 400);
+	const noStream = await request(queueApp).post("/api/showmode/queue").send({ room: "r" });
+	assert.equal(noStream.status, 400);
+	const blankRoom = await request(queueApp).post("/api/showmode/queue").send({ room: "   ", streamID: "sid" });
+	assert.equal(blankRoom.status, 400);
+	const nonStringRoom = await request(queueApp).post("/api/showmode/queue").send({ room: 42, streamID: "sid" });
+	assert.equal(nonStringRoom.status, 400);
+});
+
+test("SHOWMODE_QUEUE: a missing room on GET is a 400", async () => {
+	const queueApp = loadQueueApp({ SHOWMODE_QUEUE: "true" });
+	const res = await request(queueApp).get("/api/showmode/queue").set("Accept", "application/json");
+	assert.equal(res.status, 400);
+	const blank = await request(queueApp).get("/api/showmode/queue?room=").set("Accept", "application/json");
+	assert.equal(blank.status, 400);
+});
+
+test("SHOWMODE_QUEUE: an oversized body is rejected with a 4xx, not a 500", async () => {
+	const queueApp = loadQueueApp({ SHOWMODE_QUEUE: "true" });
+	const huge = "x".repeat(9000); // JSON payload exceeds the 8kb route limit
+	const res = await request(queueApp).post("/api/showmode/queue").send({ room: "r", streamID: "sid", topic: huge });
+	assert.ok(res.status >= 400 && res.status < 500, `expected 4xx, got ${res.status}`);
+	assert.equal(res.status, 400);
+});
+
+test("SHOWMODE_QUEUE: field length caps are enforced server-side", async () => {
+	const queueApp = loadQueueApp({ SHOWMODE_QUEUE: "true" });
+	await request(queueApp)
+		.post("/api/showmode/queue")
+		.send({ room: "r", streamID: "sid", name: "n".repeat(200), pronouns: "p".repeat(200), religiousPosition: "R".repeat(200), topic: "t".repeat(500) });
+	const get = await request(queueApp).get("/api/showmode/queue?room=r").set("Accept", "application/json");
+	const guest = get.body.guests[0];
+	assert.equal(guest.name.length, 64);
+	assert.equal(guest.pronouns.length, 40);
+	assert.equal(guest.religiousPosition.length, 80);
+	assert.equal(guest.topic.length, 200);
+});
+
+test("SHOWMODE_QUEUE: the leave beacon removes a guest and is idempotent", async () => {
+	const queueApp = loadQueueApp({ SHOWMODE_QUEUE: "true" });
+	await request(queueApp).post("/api/showmode/queue").send({ room: "r", streamID: "sid", name: "Bye" });
+
+	const leave = await request(queueApp).post("/api/showmode/queue/leave").send({ room: "r", streamID: "sid" });
+	assert.equal(leave.status, 200);
+
+	const get = await request(queueApp).get("/api/showmode/queue?room=r").set("Accept", "application/json");
+	assert.equal(get.body.count, 0);
+
+	// Removing an already-absent guest still 200s.
+	const again = await request(queueApp).post("/api/showmode/queue/leave").send({ room: "r", streamID: "sid" });
+	assert.equal(again.status, 200);
+});
+
+test("SHOWMODE_QUEUE: with the feature off (default app) the routes are absent -- POST and an API GET both 404", async () => {
+	// The default top-level `app` was required with SHOWMODE_QUEUE unset, so the
+	// routes were never registered. A POST to the unknown path falls through to
+	// the SPA fallback, which only serves index.html for GETs -> 404. The GET is
+	// sent with an API Accept header (as "our system" would) so it 404s through
+	// sendError rather than being served the index.html SPA shell that an
+	// Accept: text/html navigation to an extensionless clean URL would get.
+	const post = await request(app).post("/api/showmode/queue").send({ room: "r", streamID: "sid" });
+	assert.equal(post.status, 404);
+
+	const get = await request(app).get("/api/showmode/queue?room=r").set("Accept", "application/json");
+	assert.equal(get.status, 404);
+});

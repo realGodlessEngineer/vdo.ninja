@@ -9,7 +9,7 @@
 const params = new URLSearchParams(window.location.search);
 
 if (params.has("showmode")) {
-	import("./console.js?v=5")
+	import("./console.js?v=6")
 		.then(mod => mod.startShowmodeConsole())
 		.catch(error => {
 			console.warn("[showmode] console failed to start", error);
@@ -17,7 +17,7 @@ if (params.has("showmode")) {
 }
 
 if (params.has("cohost")) {
-	import("./cohost.js?v=5")
+	import("./cohost.js?v=6")
 		.then(mod => mod.startCohostView())
 		.catch(error => {
 			console.warn("[showmode] co-host view failed to start", error);

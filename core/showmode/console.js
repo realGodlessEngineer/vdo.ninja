@@ -59,7 +59,7 @@ const INVITES = {
 	caller: { param: "callerview", copyKey: "showmode-source-copy", copyFallback: "Copy caller invite link" },
 	cohost: { param: "cohost", copyKey: "showmode-cohost-copy", copyFallback: "Copy co-host invite link" }
 };
-const META_LIMITS = { name: 64, pronouns: 32, social: 64, socials: 5 }; // mirrors cohost.js
+const META_LIMITS = { name: 64, pronouns: 40, social: 64, socials: 5, religiousPosition: 80, topic: 200 }; // mirrors cohost.js (pronouns raised to 40 to match intake.js/server.js) + &intake fields
 
 const laneBodies = new Map(); // lane key -> the DOM element boxes live in
 const recentLevels = new Map(); // UUID -> { v, t } most recent core level-bus sample
@@ -453,10 +453,16 @@ function ensureBoxControls(box, session) {
 	metaName.className = "sm-meta__name";
 	const metaPronouns = document.createElement("span");
 	metaPronouns.className = "sm-meta__pronouns";
+	const metaPosition = document.createElement("span");
+	metaPosition.className = "sm-meta__position";
+	const metaTopic = document.createElement("span");
+	metaTopic.className = "sm-meta__topic";
 	const metaSocials = document.createElement("span");
 	metaSocials.className = "sm-meta__socials";
 	metaEl.appendChild(metaName);
 	metaEl.appendChild(metaPronouns);
+	metaEl.appendChild(metaPosition);
+	metaEl.appendChild(metaTopic);
 	metaEl.appendChild(metaSocials);
 
 	const detail = document.createElement("div");
@@ -1040,7 +1046,7 @@ function sanitizeMeta(raw) {
 		.map(handle => cleanText(handle, META_LIMITS.social))
 		.filter(Boolean)
 		.slice(0, META_LIMITS.socials);
-	return { name: cleanText(src.name, META_LIMITS.name), pronouns: cleanText(src.pronouns, META_LIMITS.pronouns), socials };
+	return { name: cleanText(src.name, META_LIMITS.name), pronouns: cleanText(src.pronouns, META_LIMITS.pronouns), socials, religiousPosition: cleanText(src.religiousPosition, META_LIMITS.religiousPosition), topic: cleanText(src.topic, META_LIMITS.topic) };
 }
 
 // Paint the details row in the box's action bar; text-only (no markup), and the
@@ -1050,7 +1056,7 @@ function renderMeta(bar, meta) {
 	if (!el) {
 		return;
 	}
-	const has = !!(meta && (meta.name || meta.pronouns || (meta.socials && meta.socials.length)));
+	const has = !!(meta && (meta.name || meta.pronouns || meta.religiousPosition || meta.topic || (meta.socials && meta.socials.length)));
 	el.classList.toggle("sm-meta--on", has);
 	if (!has) {
 		return;
@@ -1062,6 +1068,14 @@ function renderMeta(bar, meta) {
 	const pronouns = el.querySelector(".sm-meta__pronouns");
 	if (pronouns) {
 		pronouns.textContent = meta.pronouns || "";
+	}
+	const position = el.querySelector(".sm-meta__position");
+	if (position) {
+		position.textContent = meta.religiousPosition || "";
+	}
+	const topic = el.querySelector(".sm-meta__topic");
+	if (topic) {
+		topic.textContent = meta.topic || "";
 	}
 	const socials = el.querySelector(".sm-meta__socials");
 	if (socials) {
@@ -1378,6 +1392,16 @@ body.showmode-active #guestFeeds:empty { display: none; }
 }
 #showmodeConsole .sm-meta__pronouns { opacity: 0.7; }
 #showmodeConsole .sm-meta__pronouns:empty { display: none; }
+#showmodeConsole .sm-meta__position {
+	opacity: 0.85;
+	font-style: italic;
+}
+#showmodeConsole .sm-meta__position:empty { display: none; }
+#showmodeConsole .sm-meta__topic {
+	flex-basis: 100%;
+	opacity: 0.9;
+}
+#showmodeConsole .sm-meta__topic:empty { display: none; }
 #showmodeConsole .sm-meta__socials {
 	display: inline-flex;
 	flex-wrap: wrap;
